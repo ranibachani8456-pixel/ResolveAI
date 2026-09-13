@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is the starting point for an AI-powered customer support platform. This repository currently contains only a clean React frontend and Express backend foundation.
+ResolveAI is the starting point for an AI-powered customer support platform. Phase 1 adds a Prisma connection from the Express API to a local MySQL database, without application models yet.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Database, authentication, cloud services, Redis, RAG, Gemini, tickets, and document uploads are intentionally not implemented yet.
+Authentication, application data models, cloud services, Redis, RAG, Gemini, tickets, and document uploads are intentionally not implemented yet.
 
 ## Planned future stack
 
-The following technologies are planned for later phases and are not installed or configured in Phase 0:
+The following technologies describe the planned stack. Only the React/Express foundation and local MySQL/Prisma connection are configured through Phase 1:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -30,15 +30,55 @@ The following technologies are planned for later phases and are not installed or
 
 - Node.js 20 or newer
 - npm
+- MySQL Server 8 or newer, running locally on port `3306`
 
-## 1. Configure the backend
+## 1. Create the local MySQL database
+
+Sign in to MySQL with an account that can create databases:
+
+```bash
+mysql -u root -p
+```
+
+At the MySQL prompt, create the empty database and then exit:
+
+```sql
+CREATE DATABASE resolveai;
+EXIT;
+```
+
+No Prisma models or migrations are included yet. An empty database is sufficient for the connection health check.
+
+## 2. Configure the backend
 
 ```bash
 cd server
 cp .env.example .env
 npm install
+```
+
+Open `server/.env` and replace `USERNAME` and `PASSWORD` with your local MySQL credentials:
+
+```env
+PORT=5001
+NODE_ENV=development
+CLIENT_URL=http://localhost:5173
+DATABASE_URL="mysql://USERNAME:PASSWORD@localhost:3306/resolveai"
+```
+
+Keep `server/.env` private. It is ignored by Git and must never be committed.
+
+Generate and validate Prisma Client without creating tables:
+
+```bash
+npm run prisma:generate
+npm run prisma:validate
+```
+
+Start the backend with nodemon:
+
+```bash
 npm run dev
-nodemon server.js
 ```
 
 The API runs at `http://localhost:5001`. Test it at:
@@ -56,7 +96,24 @@ Expected response:
 }
 ```
 
-## 2. Configure the frontend
+Test the MySQL connection:
+
+```bash
+curl http://localhost:5001/api/db-health
+```
+
+Expected response when MySQL and `DATABASE_URL` are configured correctly:
+
+```json
+{
+  "success": true,
+  "message": "Database connection successful"
+}
+```
+
+An unavailable or incorrectly configured database returns HTTP `503` with a generic message; credentials and connection details are not exposed.
+
+## 3. Configure the frontend
 
 Open a second terminal:
 
@@ -87,3 +144,5 @@ Run these inside `server/`:
 
 - `npm run dev` starts the API with nodemon and restarts it when server files change.
 - `npm start` starts the API normally.
+- `npm run prisma:generate` regenerates Prisma Client after schema changes.
+- `npm run prisma:validate` checks the Prisma schema and configuration.

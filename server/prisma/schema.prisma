@@ -1,0 +1,11 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+//prisma was configured with MySQL in schema.prisma; use sql and get connection details fro enviroment variables
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// Application models will be added in a later phase.
