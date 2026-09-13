@@ -2,10 +2,140 @@ generator client {
   provider = "prisma-client-js"
 }
 
-//prisma was configured with MySQL in schema.prisma; use sql and get connection details fro enviroment variables
 datasource db {
   provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
-// Application models will be added in a later phase.
+enum Role {
+  OWNER
+  ADMIN
+  SUPPORT_AGENT
+  VIEWER
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum MessageSenderType {
+  CUSTOMER
+  SUPPORT_AGENT
+  AI
+  SYSTEM
+}
+
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model Organization {
+  id        Int        @id @default(autoincrement())
+  name      String     @db.VarChar(191)
+  slug      String     @unique @db.VarChar(191)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  users     User[]
+  customers Customer[]
+  tickets   Ticket[]
+  messages  Message[]
+  documents Document[]
+}
+
+model User {
+  id              Int          @id @default(autoincrement())
+  organizationId  Int
+  name            String       @db.VarChar(191)
+  email           String       @db.VarChar(191)
+  role            Role
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assignedTickets Ticket[]     @relation("TicketAssignee")
+  messages        Message[]    @relation("UserMessages")
+
+  // This unique index also supports queries scoped by organizationId.
+  @@unique([organizationId, email])
+}
+
+model Customer {
+  id             Int          @id @default(autoincrement())
+  organizationId Int
+  name           String       @db.VarChar(191)
+  email          String       @db.VarChar(191)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tickets        Ticket[]
+  messages       Message[]    @relation("CustomerMessages")
+
+  // Customers are unique by email only within their own organization.
+  @@unique([organizationId, email])
+}
+
+model Ticket {
+  id             Int            @id @default(autoincrement())
+  organizationId Int
+  customerId     Int
+  assignedToId   Int?
+  subject        String         @db.VarChar(255)
+  description    String         @db.Text
+  status         TicketStatus   @default(OPEN)
+  priority       TicketPriority @default(MEDIUM)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customer       Customer       @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  assignedTo     User?          @relation("TicketAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  messages       Message[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, customerId])
+  @@index([organizationId, assignedToId])
+  @@index([organizationId, createdAt])
+}
+
+model Message {
+  id             Int               @id @default(autoincrement())
+  organizationId Int
+  ticketId       Int
+  senderType     MessageSenderType
+  userId         Int?
+  customerId     Int?
+  content        String            @db.Text
+  createdAt      DateTime          @default(now())
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket         Ticket            @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  user           User?             @relation("UserMessages", fields: [userId], references: [id], onDelete: SetNull)
+  customer       Customer?         @relation("CustomerMessages", fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, ticketId, createdAt])
+}
+
+model Document {
+  id             Int            @id @default(autoincrement())
+  organizationId Int
+  fileName       String         @db.VarChar(255)
+  mimeType       String         @db.VarChar(127)
+  storageKey     String?        @db.VarChar(1024)
+  status         DocumentStatus @default(PENDING)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+}
