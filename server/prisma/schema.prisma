@@ -61,6 +61,7 @@ model User {
   organizationId  Int
   name            String       @db.VarChar(191)
   email           String       @db.VarChar(191)
+  passwordHash    String       @db.VarChar(255)
   role            Role
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt

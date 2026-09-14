@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is the starting point for an AI-powered customer support platform. Phase 1 adds a Prisma connection from the Express API to a local MySQL database, without application models yet.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 3, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, and JWT-based user authentication.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Authentication, application data models, cloud services, Redis, RAG, Gemini, tickets, and document uploads are intentionally not implemented yet.
+Role-based authorization, CRUD APIs, cloud services, Redis, RAG, Gemini, ticket workflows, and document uploads are intentionally not implemented yet.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. Only the React/Express foundation and local MySQL/Prisma connection are configured through Phase 1:
+The following technologies describe the planned stack. React/Express, local MySQL/Prisma, and JWT authentication are configured through Phase 3:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -47,7 +47,7 @@ CREATE DATABASE resolveai;
 EXIT;
 ```
 
-No Prisma models or migrations are included yet. An empty database is sufficient for the connection health check.
+Prisma migrations create and update the application tables inside this database.
 
 ## 2. Configure the backend
 
@@ -64,13 +64,19 @@ PORT=5001
 NODE_ENV=development
 CLIENT_URL=http://localhost:5173
 DATABASE_URL="mysql://USERNAME:PASSWORD@localhost:3306/resolveai"
+JWT_SECRET="YOUR_RANDOM_SECRET_WITH_AT_LEAST_32_CHARACTERS"
+JWT_EXPIRES_IN=1d
+BCRYPT_ROUNDS=12
 ```
 
 Keep `server/.env` private. It is ignored by Git and must never be committed.
 
-Generate and validate Prisma Client without creating tables:
+You can generate a strong JWT secret locally with `openssl rand -base64 48`. Copy its output into `JWT_SECRET`; do not commit or share it.
+
+Apply existing migrations, generate Prisma Client, and validate the schema:
 
 ```bash
+npx prisma migrate dev
 npm run prisma:generate
 npm run prisma:validate
 ```
@@ -112,6 +118,43 @@ Expected response when MySQL and `DATABASE_URL` are configured correctly:
 ```
 
 An unavailable or incorrectly configured database returns HTTP `503` with a generic message; credentials and connection details are not exposed.
+
+## Authentication API
+
+Register a new Organization and its first OWNER:
+
+```bash
+curl -X POST http://localhost:5001/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "organizationName": "Acme Support",
+    "organizationSlug": "acme-support",
+    "name": "Rani",
+    "email": "rani@example.com",
+    "password": "strong-password"
+  }'
+```
+
+Log in using the Organization slug and User email:
+
+```bash
+curl -X POST http://localhost:5001/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "organizationSlug": "acme-support",
+    "email": "rani@example.com",
+    "password": "strong-password"
+  }'
+```
+
+Copy the returned token and request the authenticated User:
+
+```bash
+curl http://localhost:5001/api/auth/me \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+Passwords are stored only as bcrypt hashes. JWTs contain the authenticated User ID, Organization ID, and role; `/api/auth/me` derives identity only from a verified Bearer token.
 
 ## 3. Configure the frontend
 
