@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 4, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, and role-protected organization member management.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 5, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, and Customer/Ticket CRUD APIs.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Ticket, customer, and message CRUD APIs, cloud services, Redis, RAG, Gemini, ticket workflows, and document uploads are intentionally not implemented yet.
+Message APIs, cloud services, Redis, RAG, Gemini, advanced ticket workflows, and document uploads are intentionally not implemented yet.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, and organization-level RBAC are configured through Phase 4:
+The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, and Customer/Ticket APIs are configured through Phase 5:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -193,6 +193,53 @@ curl -X PATCH http://localhost:5001/api/organization/users/2/role \
 ```
 
 The role update is tenant-scoped, and the only remaining OWNER cannot be demoted.
+
+## Customer and Ticket API
+
+All routes require a Bearer JWT. OWNER, ADMIN, SUPPORT_AGENT, and VIEWER may read Customers and Tickets; VIEWER cannot create or update them.
+
+| Endpoint | Write roles |
+| --- | --- |
+| `GET /api/customers` | All authenticated roles |
+| `GET /api/customers/:customerId` | All authenticated roles |
+| `POST /api/customers` | OWNER, ADMIN, SUPPORT_AGENT |
+| `PATCH /api/customers/:customerId` | OWNER, ADMIN, SUPPORT_AGENT |
+| `GET /api/tickets` | All authenticated roles |
+| `GET /api/tickets/:ticketId` | All authenticated roles |
+| `POST /api/tickets` | OWNER, ADMIN, SUPPORT_AGENT |
+| `PATCH /api/tickets/:ticketId` | OWNER, ADMIN, SUPPORT_AGENT |
+
+Create a Customer:
+
+```bash
+curl -X POST http://localhost:5001/api/customers \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "Rahul", "email": "rahul@example.com" }'
+```
+
+Create a Ticket using a Customer from the same Organization:
+
+```bash
+curl -X POST http://localhost:5001/api/tickets \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customerId": 1,
+    "subject": "Unable to login",
+    "description": "Password reset link is not working",
+    "priority": "HIGH"
+  }'
+```
+
+Ticket lists support optional `status`, `priority`, `customerId`, and `assignedToId` filters. Filters are always combined with the Organization ID from the verified JWT:
+
+```bash
+curl "http://localhost:5001/api/tickets?status=OPEN&priority=HIGH" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+Customer IDs, Ticket IDs, and assignee IDs are tenant-validated. Cross-tenant resources return `404`, and client-provided `organizationId` values are ignored.
 
 ## 3. Configure the frontend
 
