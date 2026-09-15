@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 3, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, and JWT-based user authentication.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 4, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, and role-protected organization member management.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Role-based authorization, CRUD APIs, cloud services, Redis, RAG, Gemini, ticket workflows, and document uploads are intentionally not implemented yet.
+Ticket, customer, and message CRUD APIs, cloud services, Redis, RAG, Gemini, ticket workflows, and document uploads are intentionally not implemented yet.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, local MySQL/Prisma, and JWT authentication are configured through Phase 3:
+The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, and organization-level RBAC are configured through Phase 4:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -155,6 +155,44 @@ curl http://localhost:5001/api/auth/me \
 ```
 
 Passwords are stored only as bcrypt hashes. JWTs contain the authenticated User ID, Organization ID, and role; `/api/auth/me` derives identity only from a verified Bearer token.
+
+## Organization and member API
+
+All organization routes require `Authorization: Bearer YOUR_JWT_TOKEN`. Tenant identity always comes from the verified token; a client-provided `organizationId` is never used.
+
+| Endpoint | Allowed roles |
+| --- | --- |
+| `GET /api/organization` | OWNER, ADMIN, SUPPORT_AGENT, VIEWER |
+| `GET /api/organization/users` | OWNER, ADMIN |
+| `POST /api/organization/users` | OWNER, ADMIN |
+| `PATCH /api/organization/users/:userId/role` | OWNER |
+
+Create an organization member:
+
+```bash
+curl -X POST http://localhost:5001/api/organization/users \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Aman",
+    "email": "aman@example.com",
+    "password": "strong-password",
+    "role": "SUPPORT_AGENT"
+  }'
+```
+
+New members may be ADMIN, SUPPORT_AGENT, or VIEWER. OWNER creation remains exclusive to organization registration, while an existing OWNER may promote a member later.
+
+Update a member role:
+
+```bash
+curl -X PATCH http://localhost:5001/api/organization/users/2/role \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "role": "ADMIN" }'
+```
+
+The role update is tenant-scoped, and the only remaining OWNER cannot be demoted.
 
 ## 3. Configure the frontend
 
