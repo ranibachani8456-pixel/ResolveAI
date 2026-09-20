@@ -3,13 +3,13 @@ import { env } from "./config/env.js";
 import prisma from "./config/prisma.js";
 
 // This file only starts the server; Express configuration lives in app.js.
-const httpServer = app.listen(env.port, (error) => {
-  if (error) {
-    console.error(`Unable to start ResolveAI API: ${error.message}`);
-    process.exit(1);
-  }
-
+const httpServer = app.listen(env.port, () => {
   console.log(`ResolveAI API listening on port ${env.port}`);
+});
+
+httpServer.on("error", (error) => {
+  console.error(`Unable to start ResolveAI API: ${error.message}`);
+  process.exit(1);
 });
 
 //gracefull shut down

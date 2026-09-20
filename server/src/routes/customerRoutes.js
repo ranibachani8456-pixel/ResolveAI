@@ -12,7 +12,6 @@ const router = Router();
 const writeRoles = authorizeRoles("OWNER", "ADMIN", "SUPPORT_AGENT");
 
 router.use(authMiddleware);
-
 router.get("/", getCustomers);
 router.get("/:customerId", getCustomerById);
 router.post("/", writeRoles, createNewCustomer);

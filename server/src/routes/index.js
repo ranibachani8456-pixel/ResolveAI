@@ -5,6 +5,8 @@ import authRoutes from "./authRoutes.js";
 import organizationRoutes from "./organizationRoutes.js";
 import customerRoutes from "./customerRoutes.js";
 import ticketRoutes from "./ticketRoutes.js";
+import messageRoutes from "./messageRoutes.js";
+import documentRoutes from "./documentRoutes.js";
 
 const router = Router();
 
@@ -14,6 +16,8 @@ router.use("/db-health", databaseHealthRoutes);
 router.use("/auth", authRoutes);
 router.use("/organization", organizationRoutes);
 router.use("/customers", customerRoutes);
+router.use("/documents", documentRoutes);
+router.use("/tickets/:ticketId/messages", messageRoutes);
 router.use("/tickets", ticketRoutes);
 
 export default router;

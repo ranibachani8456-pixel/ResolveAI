@@ -22,7 +22,8 @@ function parsePositiveInteger(value, fieldName) {
 
   const parsedValue = Number(value);
 
-  if (parsedValue <= 0) {
+  //oversized ticket bug error fixed
+  if (!Number.isSafeInteger(parsedValue) || parsedValue <= 0 || parsedValue > 2_147_483_647) {
     throw new TicketServiceError(400, `${fieldName} must be a positive integer`);
   }
 
