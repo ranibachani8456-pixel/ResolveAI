@@ -6,10 +6,11 @@
   "main": "src/server.js",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/message.test.js tests/document.test.js",
+    "test": "node --test tests/message.test.js tests/document.test.js tests/queueWorker.test.js tests/ingestionServices.test.js tests/documentProcessing.test.js",
     "test:integration": "RUN_DB_TESTS=1 node --test tests/phase6.integration.test.js",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
+    "worker:documents": "node src/workers/documentWorker.js",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate"
   },
@@ -18,7 +19,10 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1136.0",
+    "@aws-sdk/client-sqs": "^3.1136.0",
+    "@google/genai": "^2.23.0",
     "@prisma/client": "^6.12.0",
+    "@qdrant/js-client-rest": "^1.19.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
@@ -26,7 +30,8 @@
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.0",
-    "multer": "^2.4.0"
+    "multer": "^2.4.0",
+    "pdf-parse": "^2.4.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.14",

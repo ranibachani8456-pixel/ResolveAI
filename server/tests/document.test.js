@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import prisma from "../src/config/prisma.js";
 import { env } from "../src/config/env.js";
 import { MAX_DOCUMENT_SIZE_BYTES } from "../src/utils/documentLimits.js";
@@ -18,6 +19,7 @@ test("document service validation, tenancy, S3 coordination and safe metadata", 
     create: prisma.document.create,
     findMany: prisma.document.findMany,
     findFirst: prisma.document.findFirst,
+    deleteMany: prisma.document.deleteMany,
     region: env.awsRegion,
   };
   env.awsRegion = "us-east-1";
@@ -75,12 +77,23 @@ test("document service validation, tenancy, S3 coordination and safe metadata", 
         assert.equal(query.select.storageKey, undefined);
         return { id: 1, organizationId: 7, fileName: query.data.fileName, mimeType: query.data.mimeType, status: "PENDING" };
       };
-      const result = await uploadDocument(7, textFile({ originalname: "../../escape report.txt" }), { bucket: "private-bucket", client });
+      const queueCommands = [];
+      const sqsClient = { send: async (command) => queueCommands.push(command) };
+      const result = await uploadDocument(7, textFile({ originalname: "../../escape report.txt" }), {
+        bucket: "private-bucket", client, sqsClient, queueUrl: "https://sqs.example/queue", region: "us-east-1",
+      });
       assert.match(putInput.Key, /^organizations\/7\/documents\/[0-9a-f-]+-escape-report\.txt$/);
       assert.equal(putInput.Key.includes(".."), false);
       assert.equal(putInput.Bucket, "private-bucket");
       assert.equal(putInput.ACL, undefined);
       assert.equal(result.storageKey, undefined);
+      assert.ok(queueCommands[0] instanceof SendMessageCommand);
+      assert.equal(queueCommands[0].input.QueueUrl, "https://sqs.example/queue");
+      assert.deepEqual(JSON.parse(queueCommands[0].input.MessageBody), {
+        type: "DOCUMENT_PROCESSING_REQUESTED", version: 1, documentId: 1, organizationId: 7,
+      });
+      assert.equal(queueCommands[0].input.MessageBody.includes("storageKey"), false);
+      assert.equal(queueCommands[0].input.MessageBody.includes("ResolveAI knowledge"), false);
     });
 
     await context.test("S3 failure does not create metadata", async () => {
@@ -101,10 +114,48 @@ test("document service validation, tenancy, S3 coordination and safe metadata", 
       assert.ok(commands[1] instanceof DeleteObjectCommand);
       assert.equal(commands[0].input.Key, commands[1].input.Key);
     });
+
+    await context.test("queue failure deletes this request's metadata then its exact S3 object", async () => {
+      const s3Commands = [];
+      const client = { send: async (command) => s3Commands.push(command) };
+      let createdStorageKey;
+      prisma.document.create = async (query) => {
+        createdStorageKey = query.data.storageKey;
+        return { id: 22, organizationId: 7, status: "PENDING" };
+      };
+      prisma.document.deleteMany = async (query) => {
+        assert.deepEqual(query.where, { id: 22, organizationId: 7, storageKey: createdStorageKey });
+        return { count: 1 };
+      };
+      const sqsClient = { send: async () => { throw new Error("synthetic queue failure"); } };
+      await assert.rejects(
+        uploadDocument(7, textFile(), {
+          bucket: "test-bucket", client, sqsClient, queueUrl: "https://sqs.example/queue", region: "us-east-1",
+        }),
+        (error) => error.statusCode === 502 && error.message === "Document processing could not be queued",
+      );
+      assert.ok(s3Commands[0] instanceof PutObjectCommand);
+      assert.ok(s3Commands[1] instanceof DeleteObjectCommand);
+      assert.equal(s3Commands[1].input.Key, createdStorageKey);
+    });
+
+    await context.test("uncertain metadata cleanup preserves the S3 object", async () => {
+      const s3Commands = [];
+      const client = { send: async (command) => s3Commands.push(command) };
+      prisma.document.create = async () => ({ id: 23, organizationId: 7, status: "PENDING" });
+      prisma.document.deleteMany = async () => { throw new Error("synthetic cleanup failure"); };
+      const sqsClient = { send: async () => { throw new Error("synthetic queue failure"); } };
+      await assert.rejects(uploadDocument(7, textFile(), {
+        bucket: "test-bucket", client, sqsClient, queueUrl: "https://sqs.example/queue", region: "us-east-1",
+      }), (error) => error.statusCode === 502);
+      assert.equal(s3Commands.length, 1);
+      assert.ok(s3Commands[0] instanceof PutObjectCommand);
+    });
   } finally {
     prisma.document.create = original.create;
     prisma.document.findMany = original.findMany;
     prisma.document.findFirst = original.findFirst;
+    prisma.document.deleteMany = original.deleteMany;
     env.awsRegion = original.region;
     await prisma.$disconnect();
   }

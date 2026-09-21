@@ -3,14 +3,18 @@ import { test } from "node:test";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import app from "../src/app.js";
 import prisma from "../src/config/prisma.js";
 import s3Client from "../src/config/s3.js";
+import sqsClient from "../src/config/sqs.js";
+import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import { env } from "../src/config/env.js";
 import { signJwt } from "../src/utils/jwt.js";
+import { processDocumentJob } from "../src/services/documentProcessingService.js";
 
 // Opt-in: temporary fixtures use real MySQL, but every write is rolled back.
-test("Phase 0–7 API regression with rollback-only MySQL fixtures and mocked S3", {
+test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked external services", {
   skip: process.env.RUN_DB_TESTS !== "1", timeout: 90_000,
 }, async () => {
   const models = ["organization", "user", "customer", "ticket", "message", "document"];
@@ -19,8 +23,10 @@ test("Phase 0–7 API regression with rollback-only MySQL fixtures and mocked S3
   const rollback = new Error("Intentional fixture rollback");
   const originalTransaction = prisma.$transaction.bind(prisma);
   const originalS3Send = s3Client.send;
+  const originalSqsSend = sqsClient.send;
   const originalRegion = env.awsRegion;
   const originalBucket = env.awsS3Bucket;
+  const originalQueueUrl = env.awsSqsDocumentQueueUrl;
   const saved = [];
   let httpServer;
   try {
@@ -48,7 +54,7 @@ test("Phase 0–7 API regression with rollback-only MySQL fixtures and mocked S3
         const otherDocument = await transaction.document.create({ data: { organizationId: otherOrg.id, fileName: "other.txt", mimeType: "text/plain", storageKey: `organizations/${otherOrg.id}/documents/other.txt` } });
         // Route all app queries into this single uncommitted transaction during this test.
         for (const name of models) {
-          for (const method of ["findFirst", "findUnique", "findMany", "create", "update", "count"]) {
+          for (const method of ["findFirst", "findUnique", "findMany", "create", "update", "updateMany", "deleteMany", "count"]) {
             saved.push([prisma[name], method, prisma[name][method]]);
             prisma[name][method] = transaction[name][method].bind(transaction[name]);
           }
@@ -58,8 +64,11 @@ test("Phase 0–7 API regression with rollback-only MySQL fixtures and mocked S3
         prisma.$queryRaw = transaction.$queryRaw.bind(transaction);
         env.awsRegion = "us-east-1";
         env.awsS3Bucket = "phase7-test-bucket";
+        env.awsSqsDocumentQueueUrl = "https://sqs.example/resolveai-document-processing";
         const s3Commands = [];
+        const sqsCommands = [];
         s3Client.send = async (command) => { s3Commands.push(command); return {}; };
+        sqsClient.send = async (command) => { sqsCommands.push(command); return { MessageId: "mock-message" }; };
         httpServer = app.listen(0, "127.0.0.1");
         await once(httpServer, "listening");
         const base = `http://127.0.0.1:${httpServer.address().port}/api`;
@@ -153,11 +162,73 @@ test("Phase 0–7 API regression with rollback-only MySQL fixtures and mocked S3
           assert.match(command.input.Key, new RegExp(`^organizations/${org.id}/documents/[0-9a-f-]+-notes\\.txt$`));
           assert.equal(command.input.ACL, undefined);
         }
+        assert.equal(sqsCommands.length, 2);
+        for (const command of sqsCommands) {
+          assert.ok(command instanceof SendMessageCommand);
+          assert.equal(command.input.QueueUrl, env.awsSqsDocumentQueueUrl);
+          const body = JSON.parse(command.input.MessageBody);
+          assert.equal(body.organizationId, org.id);
+          assert.deepEqual(Object.keys(body).sort(), ["documentId", "organizationId", "type", "version"]);
+          assert.equal(command.input.MessageBody.includes("storageKey"), false);
+        }
+        const ingestionDependencies = {
+          downloadDocument: async () => Buffer.from("Phase 9 integration knowledge"),
+          extractDocumentText: async (_document, buffer) => buffer.toString(),
+          chunkDocumentText: (text) => [{ chunkIndex: 0, text }],
+          embedTexts: async () => [[1, 0, 0]],
+          upsertDocumentVectors: async () => {},
+        };
+        assert.deepEqual(
+          await processDocumentJob(
+            { documentId: document.id, organizationId: org.id },
+            transaction,
+            ingestionDependencies,
+          ),
+          { outcome: "COMPLETED", status: "READY", chunkCount: 1 },
+        );
+        assert.equal(
+          (await transaction.document.findFirst({ where: { id: document.id, organizationId: org.id } })).status,
+          "READY",
+        );
+        assert.deepEqual(
+          await processDocumentJob(
+            { documentId: document.id, organizationId: org.id },
+            transaction,
+            ingestionDependencies,
+          ),
+          { outcome: "ALREADY_READY", status: "READY" },
+        );
+        assert.deepEqual(
+          await processDocumentJob(
+            { documentId: otherDocument.id, organizationId: org.id },
+            transaction,
+            ingestionDependencies,
+          ),
+          { outcome: "MISSING", status: null },
+        );
+        for (const status of ["READY", "FAILED"]) {
+          const statusDocument = await transaction.document.create({
+            data: { organizationId: org.id, fileName: `${status}.txt`, mimeType: "text/plain", status },
+          });
+          const result = await processDocumentJob(
+            { documentId: statusDocument.id, organizationId: org.id },
+            transaction,
+            ingestionDependencies,
+          );
+          assert.equal(result.status, status);
+          assert.equal((await transaction.document.findUnique({ where: { id: statusDocument.id } })).status, status);
+        }
         const documentsBeforeS3Failure = await transaction.document.count({ where: { organizationId: org.id } });
         s3Client.send = async () => { throw new Error("synthetic S3 failure"); };
         await upload(502, tokens.OWNER, textUpload);
         assert.equal(await transaction.document.count({ where: { organizationId: org.id } }), documentsBeforeS3Failure);
         s3Client.send = async (command) => { s3Commands.push(command); return {}; };
+        const documentsBeforeQueueFailure = await transaction.document.count({ where: { organizationId: org.id } });
+        sqsClient.send = async () => { throw new Error("synthetic SQS failure"); };
+        await upload(502, tokens.OWNER, textUpload);
+        assert.equal(await transaction.document.count({ where: { organizationId: org.id } }), documentsBeforeQueueFailure);
+        assert.ok(s3Commands.at(-1) instanceof DeleteObjectCommand);
+        sqsClient.send = async (command) => { sqsCommands.push(command); return { MessageId: "mock-message" }; };
         for (const id of ["0", "-1", "1.5", "bad", "2147483648", "9007199254740993"]) {
           await request(`/tickets/${id}/messages`, 400, tokens.OWNER);
           await request(`/tickets/${id}/messages`, 400, tokens.OWNER, "POST", { content: "hello" });
@@ -221,15 +292,19 @@ test("Phase 0–7 API regression with rollback-only MySQL fixtures and mocked S3
     } finally {
       for (const [object, key, original] of saved.reverse()) object[key] = original;
       s3Client.send = originalS3Send;
+      sqsClient.send = originalSqsSend;
       env.awsRegion = originalRegion;
       env.awsS3Bucket = originalBucket;
+      env.awsSqsDocumentQueueUrl = originalQueueUrl;
       if (httpServer) await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
     }
     assert.deepEqual(await counts(), before, "all fixture writes must be rolled back");
   } finally {
     s3Client.send = originalS3Send;
+    sqsClient.send = originalSqsSend;
     env.awsRegion = originalRegion;
     env.awsS3Bucket = originalBucket;
+    env.awsSqsDocumentQueueUrl = originalQueueUrl;
     await prisma.$disconnect();
   }
 });

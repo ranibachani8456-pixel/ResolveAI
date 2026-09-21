@@ -6,6 +6,7 @@ import prisma from "../config/prisma.js";
 import s3Client from "../config/s3.js";
 import { env } from "../config/env.js";
 import { MAX_DOCUMENT_SIZE_BYTES } from "../utils/documentLimits.js";
+import { enqueueDocumentProcessing } from "./documentQueueService.js";
 
 const ALLOWED_MIME_TYPES = new Set(["application/pdf", "text/plain"]);
 
@@ -110,8 +111,9 @@ export async function uploadDocument(organizationId, file, storageOverrides) {
     throw new DocumentServiceError(502, "Document upload failed");
   }
 
+  let document;
   try {
-    return await prisma.document.create({
+    document = await prisma.document.create({
       data: {
         organizationId,
         fileName,
@@ -130,6 +132,40 @@ export async function uploadDocument(organizationId, file, storageOverrides) {
     }
     console.error("Document metadata creation failed", error);
     throw new DocumentServiceError(500, "Unable to save document metadata");
+  }
+
+  try {
+    await enqueueDocumentProcessing(
+      { documentId: document.id, organizationId },
+      {
+        client: storageOverrides?.sqsClient,
+        queueUrl: storageOverrides?.queueUrl,
+        region: storageOverrides?.region,
+      },
+    );
+    return document;
+  } catch (error) {
+    console.error("Document queue publish failed", error);
+    let metadataCompensated = false;
+    try {
+      await prisma.document.deleteMany({
+        where: { id: document.id, organizationId, storageKey },
+      });
+      metadataCompensated = true;
+    } catch (cleanupError) {
+      // Keep the exact S3 object when metadata deletion is uncertain so the row
+      // cannot be left pointing at an object that this request removed.
+      console.error("Document metadata cleanup failed after queue error", cleanupError);
+    }
+
+    if (metadataCompensated) {
+      try {
+        await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: storageKey }));
+      } catch (cleanupError) {
+        console.error("S3 cleanup failed after queue error", cleanupError);
+      }
+    }
+    throw new DocumentServiceError(502, "Document processing could not be queued");
   }
 }
 

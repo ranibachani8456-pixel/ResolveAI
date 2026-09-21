@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 7, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, and private S3 document uploads.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 9, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, and document ingestion into Qdrant using Gemini embeddings.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-SQS, document processing, Redis, Qdrant, RAG, Gemini, and advanced ticket workflows are intentionally not implemented yet.
+Question answering, retrieval APIs, grounded response generation, Redis, and advanced ticket workflows are intentionally not implemented yet. Phase 9 builds the vector knowledge base only; it does not implement RAG retrieval or AI answers.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, and private S3 document storage are configured through Phase 7:
+The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, and Qdrant indexing are configured through Phase 9:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -69,6 +69,15 @@ JWT_EXPIRES_IN=1d
 BCRYPT_ROUNDS=12
 AWS_REGION=us-east-1
 AWS_S3_BUCKET=your-private-resolveai-documents-bucket
+AWS_SQS_DOCUMENT_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/YOUR_ACCOUNT_ID/resolveai-document-processing
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+EMBEDDING_MODEL=gemini-embedding-2
+EMBEDDING_DIMENSION=768
+EMBEDDING_BATCH_SIZE=20
+QDRANT_URL=https://YOUR_CLUSTER.cloud.qdrant.io
+QDRANT_API_KEY=YOUR_QDRANT_API_KEY
+QDRANT_COLLECTION=resolveai_documents
+DOCUMENT_PROCESSING_LEASE_SECONDS=240
 ```
 
 Keep `server/.env` private. It is ignored by Git and must never be committed.
@@ -349,7 +358,7 @@ npx prisma migrate status
 
 POST accepts exactly one `multipart/form-data` field named `file`. PDF (`application/pdf`) and UTF-8 plain text (`text/plain`) are supported, up to 10 MB. Empty, oversized, unsupported, and content-type-spoofed files are rejected. The authenticated organization—not request body data—controls ownership.
 
-S3 privately stores the file bytes; MySQL stores safe metadata with status `PENDING`. Processing, SQS, chunking, embeddings, Qdrant, Gemini, and RAG are deferred to later phases. Keys are generated as `organizations/{authenticatedOrganizationId}/documents/{UUID}-{sanitizedFilename}`. No public-read ACL is set and API responses do not reveal the storage key.
+S3 privately stores the file bytes; MySQL stores safe metadata with status `PENDING`, then SQS requests Phase 9 ingestion. Keys are generated as `organizations/{authenticatedOrganizationId}/documents/{UUID}-{sanitizedFilename}`. No public-read ACL is set and API responses do not reveal the storage key.
 
 Configure a private S3 bucket and AWS region. Credentials are intentionally absent from `.env.example`: the AWS SDK uses its normal provider chain, such as a local AWS profile or an IAM role in AWS.
 
@@ -383,6 +392,264 @@ curl -i "$BASE_URL/documents/not-a-number" -H "Authorization: Bearer $READER_TOK
 
 The supplied `organizationId=999` is deliberately ignored; returned ownership must match the authenticated organization. GET lists newest first using `createdAt DESC, id DESC`; missing and cross-tenant IDs return the same `404`.
 
+## Asynchronous document jobs (Phase 8)
+
+The API now publishes a lightweight SQS job after S3 upload and `PENDING` metadata creation:
+
+```text
+POST /api/documents → private S3 object → PENDING MySQL row → SQS job → HTTP 201
+                                                                    ↓
+                                             standalone document worker
+                                                                    ↓
+                                      conditional PENDING → PROCESSING
+```
+
+The queue never carries file bytes, JWTs, credentials, storage keys, or user objects. Its strict versioned contract is:
+
+```json
+{
+  "type": "DOCUMENT_PROCESSING_REQUESTED",
+  "version": 1,
+  "documentId": 17,
+  "organizationId": 1
+}
+```
+
+Configure the main queue URL in the private `server/.env`; credentials continue to come from the AWS SDK default provider chain (`AWS_PROFILE` may be used locally but should not be committed):
+
+```env
+AWS_REGION=us-east-1
+AWS_S3_BUCKET=your-private-resolveai-documents-bucket
+AWS_SQS_DOCUMENT_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/YOUR_ACCOUNT_ID/resolveai-document-processing
+```
+
+Run the API and worker as separate processes:
+
+```bash
+# Terminal 1
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run dev
+
+# Terminal 2
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run worker:documents
+```
+
+The worker long-polls for up to 20 seconds and receives at most five messages per request. It validates the entire message contract, queries/updates using both `documentId` and `organizationId`, and atomically claims only `PENDING` rows. SQS Standard queues provide at-least-once delivery, so duplicate messages are expected:
+
+- `PENDING` is atomically claimed as `PROCESSING`, then Phase 9 runs the ingestion pipeline described below.
+- A fresh `PROCESSING` delivery is not acknowledged; it becomes visible again for a later retry. A stale processing lease can be reclaimed safely.
+- `READY` is acknowledged as already complete.
+- `FAILED` is deliberately acknowledged and left failed; a future explicit retry flow may reset/requeue it.
+- Missing/cross-tenant documents are acknowledged safe no-ops.
+- Invalid messages and unexpected database/SQS failures are not deleted. Visibility timeout retries them, then the DLQ redrive policy isolates repeated failures.
+
+### Upload consistency
+
+S3, MySQL, and SQS cannot share an ACID transaction. If SQS publishing fails after metadata creation, the API conditionally deletes the exact row created by that request and then deletes its exact generated S3 object. If metadata cleanup is uncertain, the S3 object is retained rather than leaving a surviving row pointing to a deleted object. Cleanup failures are logged and can require operational reconciliation. An ambiguous network failure may have delivered the job before compensation; the worker safely acknowledges it as missing.
+
+### SQS and DLQ setup in the AWS Console
+
+Use the same AWS Region as `AWS_REGION`.
+
+1. Open **Amazon SQS → Queues → Create queue**.
+2. Create the DLQ first:
+   - Type: **Standard**.
+   - Name: `resolveai-document-processing-dlq`.
+   - Visibility timeout: **60 seconds**.
+   - Message retention: **14 days** so failures remain available for investigation.
+   - Receive message wait time: **20 seconds**.
+   - Encryption: enable **SSE-SQS** unless your organization requires a customer-managed KMS key.
+   - Leave delivery delay at zero and create the queue.
+3. Create the main queue:
+   - Type: **Standard**; strict ordering is unnecessary and the worker is idempotent.
+   - Name: `resolveai-document-processing`.
+   - Visibility timeout: **at least 300 seconds** for the initial Phase 9 setup. It should exceed normal end-to-end ingestion time and the configured 240-second processing lease.
+   - Message retention: **4 days** for development.
+   - Receive message wait time: **20 seconds** to reduce empty responses and cost.
+   - Encryption: enable **SSE-SQS**.
+   - Expand **Dead-letter queue**, enable it, select `resolveai-document-processing-dlq`, and set **Maximum receives** to `5` so transient errors get several attempts without creating a poison-message loop.
+4. Return to the DLQ, choose **Edit → Redrive allow policy**, choose **byQueue**, and allow only the ARN of `resolveai-document-processing`.
+5. Open the main queue's details page and copy its **URL** (not its ARN) into `AWS_SQS_DOCUMENT_QUEUE_URL`.
+
+The worker explicitly requests 20-second long polling. AWS recommends long polling to reduce empty/false-empty responses, and the visibility timeout must exceed expected processing time. A Standard queue can deliver duplicates, which is why the database transition is conditional. See the AWS guidance for [long polling](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/best-practices-setting-up-long-polling.html), [visibility timeouts](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html), and [DLQs](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html).
+
+### Least-privilege IAM addition
+
+Attach this additional policy to the local ResolveAI IAM identity, replacing all three placeholders. The code does not call `ChangeMessageVisibility` or `GetQueueAttributes`, so those permissions are intentionally absent.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ResolveAIDocumentQueueProducer",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:YOUR_REGION:YOUR_ACCOUNT_ID:resolveai-document-processing"
+    },
+    {
+      "Sid": "ResolveAIDocumentQueueWorker",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage"
+      ],
+      "Resource": "arn:aws:sqs:YOUR_REGION:YOUR_ACCOUNT_ID:resolveai-document-processing"
+    }
+  ]
+}
+```
+
+Do not use `sqs:*` or `Resource: "*"`. The DLQ needs no application IAM permission because SQS performs redrive according to the queue policy. AWS supports scoping SQS actions to the queue ARN; see the [official IAM examples](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-basic-examples-of-iam-policies.html).
+
+### Real-AWS verification
+
+After the API and worker are running in separate terminals, use an OWNER/ADMIN token and a small text file:
+
+```bash
+printf 'ResolveAI Phase 8 queue test\n' > /tmp/resolveai-phase8.txt
+TOKEN='REPLACE_WITH_OWNER_OR_ADMIN_JWT'
+
+curl -i -X POST http://localhost:5001/api/documents \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'file=@/tmp/resolveai-phase8.txt;type=text/plain'
+
+curl -s http://localhost:5001/api/documents \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Expect `201`, a private S3 object, and a safe API response without `storageKey`. The response is the creation snapshot and says `PENDING`; with Phase 9 configured, the follow-up GET should progress through `PROCESSING` to `READY`. Logs contain identifiers and counts, never document text or vectors.
+
+```text
+Document job handled: documentId=17 organizationId=1 outcome=COMPLETED status=READY
+```
+
+If the message disappears too quickly to view, verify the transition with the GET response and worker log, then inspect the SQS queue's CloudWatch monitoring graphs for messages sent, received, and deleted. For a visual queue check, stop the worker before uploading, confirm one available message in the main queue, then restart the worker; do not repeatedly poll with the Console's receive tool because receives count toward the DLQ redrive threshold.
+
+## Document ingestion pipeline (Phase 9)
+
+The standalone worker now performs the complete knowledge-base ingestion path:
+
+```text
+SQS job → tenant-scoped MySQL lookup → private S3 download
+        → text/PDF extraction → normalization → deterministic chunks
+        → Gemini embeddings → idempotent Qdrant upserts → READY
+```
+
+The API process does not require Gemini or Qdrant configuration to start. Those settings are read only when the worker processes a document.
+
+### Extraction, normalization, and chunking
+
+- `text/plain` is decoded as strict UTF-8. Invalid, empty, or unusable text is a permanent document failure.
+- `application/pdf` is extracted with `pdf-parse`. Text-based PDFs are supported; OCR is deliberately not included, so scanned/image-only PDFs become `FAILED` with a safe internal reason.
+- Normalization removes null characters, converts CRLF/CR to LF, trims trailing line whitespace and outer whitespace, and collapses excessive blank lines while preserving punctuation and paragraphs.
+- Chunking targets 1,000 characters with 150 characters of contextual overlap. It prefers paragraph, sentence, newline, then word boundaries and enforces a 1,000-character maximum. Ordering and `chunkIndex` are deterministic.
+
+The worker refuses retrieved objects larger than the existing 10 MB upload limit and obtains `storageKey` only from the trusted MySQL row selected by both `documentId` and `organizationId`.
+
+### Embeddings and Qdrant
+
+Gemini uses the supported `@google/genai` SDK through a dedicated `embedTexts(texts)` abstraction. The default model is `gemini-embedding-2`, using `RETRIEVAL_DOCUMENT`, 768 dimensions, and batches of 20. The Qdrant collection uses 768-dimensional vectors with Cosine distance. If the collection exists, its dimension and distance are verified; it is never deleted or recreated during processing.
+
+Phase 9 adds only three runtime packages: `@google/genai` for Gemini embeddings, `@qdrant/js-client-rest` as Qdrant's official REST client, and `pdf-parse` for Node-compatible text extraction from PDFs.
+
+Each Qdrant point contains only safe, tenant-filterable payload data:
+
+```json
+{
+  "organizationId": 1,
+  "documentId": 30,
+  "chunkIndex": 0,
+  "text": "Document chunk text...",
+  "fileName": "guide.pdf",
+  "mimeType": "application/pdf"
+}
+```
+
+The payload never contains `storageKey`, JWTs, credentials, or passwords. Phase 10 retrieval must always filter on `organizationId` before using these points.
+
+Point IDs are deterministic hashes of `organizationId:documentId:chunkIndex`. SQS duplicate delivery, a partial Qdrant batch failure, or a retry after a failed MySQL `READY` update therefore overwrites the same points instead of creating duplicates. MySQL and Qdrant are not an ACID transaction: a failure can temporarily leave already-upserted points for a `PROCESSING` document, but a retry converges on the same point set.
+
+### Status, retry, and concurrency behavior
+
+- `PENDING`: uploaded and queued.
+- `PROCESSING`: atomically claimed and ingestion is active or awaiting retry.
+- `READY`: extraction, every embedding, every Qdrant upsert, and the final MySQL update succeeded.
+- `FAILED`: a permanent content/metadata error that retrying cannot fix.
+
+Malformed content, unsupported trusted MIME types, missing stored objects, empty extraction, and oversized stored objects are permanent: the worker marks the row `FAILED` and deletes the SQS message. Temporary S3, Gemini, Qdrant, or MySQL failures throw out of processing, leave the row `PROCESSING`, and do not delete the message, allowing SQS retries and eventual DLQ redrive.
+
+A processing lease prevents an immediately duplicated message from starting concurrent work. Fresh `PROCESSING` jobs are left unacknowledged; after `DOCUMENT_PROCESSING_LEASE_SECONDS` they may be reclaimed and reprocessed. Deterministic upserts make that retry safe. This is intentionally a practical lease, not a distributed lock: unusually long processing beyond the lease can overlap on two workers, but both write identical point IDs and only one final state is retained.
+
+### Required worker environment
+
+Add real values only to private `server/.env`:
+
+```env
+GEMINI_API_KEY=YOUR_PRIVATE_GEMINI_API_KEY
+EMBEDDING_MODEL=gemini-embedding-2
+EMBEDDING_DIMENSION=768
+EMBEDDING_BATCH_SIZE=20
+
+QDRANT_URL=https://YOUR_CLUSTER.cloud.qdrant.io
+QDRANT_API_KEY=YOUR_PRIVATE_QDRANT_API_KEY
+QDRANT_COLLECTION=resolveai_documents
+
+DOCUMENT_PROCESSING_LEASE_SECONDS=240
+```
+
+The configured embedding dimension must match the existing Qdrant collection. Changing the model or dimension later requires an intentional collection migration; normal processing rejects an incompatible collection instead of destroying vectors.
+
+### Recommended Qdrant Cloud setup
+
+Qdrant Cloud is the simplest Phase 9 development choice because it requires no local daemon or Docker and is reachable by the worker wherever it runs. Local Qdrant offers offline development and lower latency, but you must operate the process and persist its data yourself.
+
+1. Sign in at [Qdrant Cloud](https://cloud.qdrant.io/) and create a cluster in a nearby region.
+2. Open the cluster, copy its HTTPS endpoint, and create an API key with data-plane access.
+3. Put the endpoint and key in private `server/.env` as `QDRANT_URL` and `QDRANT_API_KEY`.
+4. Leave `QDRANT_COLLECTION=resolveai_documents`. The worker creates it on first ingestion with Cosine distance and the configured vector size.
+5. Never paste the key into source code, documentation, shared shell history, or Git.
+
+For a local Qdrant instance, follow the [official Qdrant quickstart](https://qdrant.tech/documentation/quick-start/) for your preferred supported installation, expose its REST port `6333`, use `QDRANT_URL=http://127.0.0.1:6333`, and leave `QDRANT_API_KEY` blank. No Docker files are added to this repository in Phase 9.
+
+### Gemini embedding setup
+
+1. Open [Google AI Studio](https://aistudio.google.com/app/apikey) and create an API key in your own Google project.
+2. Put it only in private `server/.env` as `GEMINI_API_KEY`.
+3. Keep `EMBEDDING_MODEL=gemini-embedding-2` and `EMBEDDING_DIMENSION=768` unless you intentionally migrate the Qdrant collection too.
+4. Review quota/billing for the selected Google project; provider rate limits are treated as transient and retried through SQS.
+
+### Real Phase 9 verification
+
+First ensure MySQL, the private S3 bucket, the SQS main queue/DLQ, Gemini, and Qdrant values are configured. Set the SQS visibility timeout to at least 300 seconds. Then run:
+
+```bash
+# Terminal 1: API
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run dev
+
+# Terminal 2: worker
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run worker:documents
+
+# Terminal 3: upload a real text document
+printf 'ResolveAI refund policy\n\nRefunds are reviewed within five business days.\n' > /tmp/resolveai-phase9.txt
+TOKEN='REPLACE_WITH_OWNER_OR_ADMIN_JWT'
+curl -i -X POST http://localhost:5001/api/documents \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'file=@/tmp/resolveai-phase9.txt;type=text/plain'
+
+# Poll the safe metadata endpoint; replace the ID returned by POST.
+DOCUMENT_ID=REPLACE_WITH_DOCUMENT_ID
+curl -s http://localhost:5001/api/documents/$DOCUMENT_ID \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Expected progression is `PENDING` → `PROCESSING` → `READY`. In Qdrant Cloud, inspect `resolveai_documents` and verify the points have 768 values and the tenant-safe payload above. Also test a real text-based PDF. A scanned PDF should become `FAILED` because OCR is outside Phase 9.
+
+Automated tests mock S3, Gemini, Qdrant, and SQS; they do not spend provider quota or modify cloud data. The optional MySQL integration test uses rollback-only fixtures and mocked external services. Real Phase 9 end-to-end behavior must be verified using the commands above and should not be claimed until completed.
+
 ## 3. Configure the frontend
 
 Open a second terminal:
@@ -414,7 +681,8 @@ Run these inside `server/`:
 
 - `npm run dev` starts the API with nodemon and restarts it when server files change.
 - `npm start` starts the API normally.
-- `npm test` runs Message and Document service tests without real database or AWS writes.
-- `npm run test:integration` runs rollback-only local MySQL/API regression tests with mocked S3.
+- `npm run worker:documents` runs the standalone long-polling SQS document worker.
+- `npm test` runs Message, Document, ingestion-service, SQS producer, and worker tests without real database or cloud writes.
+- `npm run test:integration` runs rollback-only local MySQL/API regression tests with mocked external services.
 - `npm run prisma:generate` regenerates Prisma Client after schema changes.
 - `npm run prisma:validate` checks the Prisma schema and configuration.
