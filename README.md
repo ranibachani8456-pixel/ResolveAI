@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 11, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 12, it includes a production-style React support dashboard backed by the existing Express API, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Automatic ticket replies, Redis, streaming, frontend AI UI, reranking, hybrid search, and advanced ticket workflows are intentionally not implemented yet. Phase 11 adds persistent conversations while preserving Phase 10's stateless endpoint.
+Automatic ticket replies, Redis, streaming, reranking, hybrid search, and advanced ticket workflows are intentionally not implemented yet. Phase 12 adds the authenticated support workspace without changing the established backend contracts.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, grounded RAG answers, and persistent AI conversations are configured through Phase 11:
+The following technologies describe the planned stack. React/Express, the support dashboard, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, grounded RAG answers, and persistent AI conversations are configured through Phase 12:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -936,7 +936,87 @@ curl -i -X POST "$BASE_URL/ai/conversations/$CONVERSATION_ID/messages" \
   -d '{"question":"Do not reveal another tenant conversation"}'
 ```
 
-Automated tests mock Gemini, Qdrant, S3, and SQS where appropriate. The rollback-only integration test requires migrated local MySQL. Known Phase 11 limitations: no pagination cursor beyond the safe 100-message detail limit, no source persistence, no retry idempotency key, no concurrent-turn serialization, no deletion/renaming endpoint, no streaming/WebSockets, and no frontend chat UI.
+Automated tests mock Gemini, Qdrant, S3, and SQS where appropriate. The rollback-only integration test requires migrated local MySQL. Known Phase 11 limitations: no pagination cursor beyond the safe 100-message detail limit, no source persistence, no retry idempotency key, no concurrent-turn serialization, no deletion/renaming endpoint, and no streaming/WebSockets.
+
+## Production support dashboard (Phase 12)
+
+Phase 12 replaces the original health-check screen with a responsive authenticated workspace. It uses only existing backend endpoints; no server routes, database models, or Phase 13 capabilities were added.
+
+### Frontend architecture
+
+```text
+client/src/
+├── api/          # one fetch client plus domain-specific API modules
+├── components/   # shared controls, feedback states, and application shell
+├── constants/    # role and ticket display metadata
+├── context/      # reducer-based authentication and toast state
+├── features/     # auth, dashboard, tickets, customers, knowledge, AI, and team pages
+├── hooks/        # context access hooks
+├── test/         # Vitest and Testing Library setup
+└── utils/        # date, name, and text formatting helpers
+```
+
+The centralized API client attaches the stored Bearer token, accepts `AbortSignal`, handles JSON and `FormData`, normalizes safe API errors, and publishes one unauthorized event for `401` responses. The auth reducer owns token restoration through `GET /api/auth/me`, session persistence, login, registration, and logout. A protected route blocks application screens until restoration completes; public auth routes redirect an already authenticated user.
+
+Major pages are lazy-loaded with `React.lazy` and `Suspense`. Lists, derived dashboard statistics, navigation metadata, and context values use memoization where it avoids repeated work. Page requests are cancelled during cleanup, repeated form submissions are guarded, and route/error/loading/empty states have dedicated UI.
+
+### Routes and access-aware navigation
+
+| Frontend route | Purpose |
+| --- | --- |
+| `/login` | Organization-aware sign in |
+| `/register` | Create an organization and its first owner |
+| `/app/dashboard` | Ticket overview and recent activity derived from the ticket list |
+| `/app/tickets` | Filter, inspect, create, and update tickets |
+| `/app/tickets/:ticketId` | Ticket detail, assignment/status editing, and conversation messages |
+| `/app/customers` | Search, list, and create customers |
+| `/app/customers/:customerId` | Customer profile and related tickets |
+| `/app/knowledge` | Document list, upload, processing status, and failure visibility |
+| `/app/ai` and `/app/ai/:conversationId` | Persistent grounded AI conversations |
+| `/app/team` | Organization member list and owner-only role editing |
+
+The UI reflects the backend's role policy rather than inventing new authorization rules. OWNER and ADMIN users receive team and document-management controls; only OWNER can change member roles. OWNER, ADMIN, and SUPPORT_AGENT can create or modify support records. VIEWER receives read-only support pages while retaining the existing read-only AI access. The API remains the final authority for every action.
+
+### Knowledge and AI behavior
+
+Knowledge uploads accept PDF or plain-text files up to 10 MB before sending multipart data. Documents in `PENDING` or `PROCESSING` are refreshed every five seconds with a non-overlapping timer. Polling stops when no documents are in progress, after two minutes, or when the page unmounts. Terminal `READY` and `FAILED` states remain visible; the current API intentionally exposes status but no internal failure details.
+
+The AI workspace lists creator-owned conversations, loads persisted chronological messages, creates conversations, and sends one guarded question at a time. Each response is rendered as plain React text, never injected HTML. Source cards are shown for the current response because Phase 11 intentionally does not persist sources. The most recently selected conversation ID is kept in session storage for convenient same-tab navigation.
+
+### Loading, feedback, and performance decisions
+
+Major list/detail surfaces use shape-matched skeletons so the page structure stays stable while data loads. Reusable empty and error states provide context and retry actions. A separate reducer-backed toast provider handles bounded success, error, warning, and informational notices, while form-specific failures remain inline. Toast timers and in-flight page requests are cleaned up when their owners unmount.
+
+Repeated list rows and message items use `React.memo`; filtered lists, dashboard counts, polling state, and role-aware navigation use `useMemo`; callbacks are stabilized only when they are passed to memoized children or form part of an effect dependency. This keeps the high-density screens efficient without blanket memoization. Major pages are split into separate production chunks.
+
+The only client environment variable is `VITE_API_BASE_URL`. Leave it blank during local development to use Vite's `/api` proxy to port 5001, or set it to the deployed API origin. It is a public build-time value and must never contain a credential.
+
+### Frontend verification
+
+Run these inside `client/`:
+
+```bash
+npm test
+npm run build
+npm audit
+```
+
+The focused test suite covers centralized API behavior and auth headers, protected-route redirects, role-aware navigation, upload validation and polling decisions, plus successful and failed AI message interactions. No browser end-to-end framework is introduced in this phase.
+
+### Manual Phase 12 test flow
+
+1. Start local MySQL and apply existing migrations if needed: `cd server && npx prisma migrate dev`.
+2. Start the API in one terminal: `cd server && npm run dev`.
+3. Start the SQS document worker in another terminal: `cd server && npm run worker:documents`.
+4. Start the frontend in a third terminal: `cd client && npm run dev`, then open `http://localhost:5173`.
+5. Register a new organization or sign in with an existing organization slug and account; refresh a protected page and confirm `/api/auth/me` restores the session.
+6. Open the dashboard, customers, and tickets. Create a customer and ticket, open the ticket, update supported properties, and send a message as OWNER, ADMIN, or SUPPORT_AGENT.
+7. Open Knowledge as OWNER or ADMIN, upload one `.txt` or text-based `.pdf` file smaller than 10 MB, and watch `PENDING` progress through `PROCESSING` to `READY` (or show `FAILED`). Confirm unsupported and oversized files are rejected before upload.
+8. Open AI Assistant, create a conversation, ask a question grounded in the READY document, and ask a follow-up. Confirm the latest sources are shown and the conversation persists after refresh.
+9. As OWNER, edit a team member role. Confirm ADMIN can view and add members but cannot change roles; confirm SUPPORT_AGENT and VIEWER do not receive team navigation.
+10. Log out and confirm protected routes return to `/login`. Repeat key flows with a VIEWER account and at a narrow/mobile viewport, including keyboard navigation, modal focus containment, Escape-to-close, visible focus styles, loading states, empty states, and error recovery.
+
+Known Phase 12 limitations follow the current API: lists are bounded only by backend responses because no pagination contract exists; dashboard metrics are client-derived snapshots rather than analytics; historical AI sources cannot be displayed because sources are response-only; document status uses bounded polling rather than push events; JWT storage remains browser local storage because Phase 12 preserves the existing token architecture; and AI responses are non-streaming. No delete operations are shown because the backend exposes none.
 
 ## 3. Configure the frontend
 
@@ -951,10 +1031,10 @@ npm run dev
 
 Open `http://localhost:5173`. During development, Vite proxies `/api` requests to the backend on port `5001`.
 
-For a separately hosted API, set `VITE_API_URL` in `client/.env` to the API origin, for example:
+For a separately hosted API, set `VITE_API_BASE_URL` in `client/.env` to the API origin. The client adds `/api` when needed:
 
 ```env
-VITE_API_URL=https://api.example.com
+VITE_API_BASE_URL=https://api.example.com
 ```
 
 ## Available scripts
@@ -964,6 +1044,8 @@ Run these inside `client/`:
 - `npm run dev` starts Vite's development server.
 - `npm run build` creates a production frontend build.
 - `npm run preview` previews the production build locally.
+- `npm test` runs the Phase 12 frontend tests once.
+- `npm run test:watch` runs frontend tests in watch mode.
 
 Run these inside `server/`:
 
