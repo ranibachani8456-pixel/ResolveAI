@@ -7,6 +7,7 @@ import customerRoutes from "./customerRoutes.js";
 import ticketRoutes from "./ticketRoutes.js";
 import messageRoutes from "./messageRoutes.js";
 import documentRoutes from "./documentRoutes.js";
+import aiRoutes from "./aiRoutes.js";
 
 const router = Router();
 
@@ -17,6 +18,7 @@ router.use("/auth", authRoutes);
 router.use("/organization", organizationRoutes);
 router.use("/customers", customerRoutes);
 router.use("/documents", documentRoutes);
+router.use("/ai", aiRoutes);
 router.use("/tickets/:ticketId/messages", messageRoutes);
 router.use("/tickets", ticketRoutes);
 

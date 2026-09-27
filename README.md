@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 9, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, and document ingestion into Qdrant using Gemini embeddings.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 10, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, and tenant-safe grounded knowledge-base answers using Gemini.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Question answering, retrieval APIs, grounded response generation, Redis, and advanced ticket workflows are intentionally not implemented yet. Phase 9 builds the vector knowledge base only; it does not implement RAG retrieval or AI answers.
+Conversation memory, automatic ticket replies, Redis, streaming, frontend AI UI, and advanced ticket workflows are intentionally not implemented yet. Phase 10 provides only stateless question → retrieval → grounded answer behavior.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, and Qdrant indexing are configured through Phase 9:
+The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, and grounded RAG answers are configured through Phase 10:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -74,9 +74,13 @@ GEMINI_API_KEY=YOUR_GEMINI_API_KEY
 EMBEDDING_MODEL=gemini-embedding-2
 EMBEDDING_DIMENSION=768
 EMBEDDING_BATCH_SIZE=20
+GEMINI_GENERATION_MODEL=gemini-3.8-flash
 QDRANT_URL=https://YOUR_CLUSTER.cloud.qdrant.io
 QDRANT_API_KEY=YOUR_QDRANT_API_KEY
 QDRANT_COLLECTION=resolveai_documents
+RAG_TOP_K=5
+RAG_CONTEXT_MAX_CHARS=6000
+RAG_QUESTION_MAX_CHARS=2000
 DOCUMENT_PROCESSING_LEASE_SECONDS=240
 ```
 
@@ -650,6 +654,143 @@ Expected progression is `PENDING` → `PROCESSING` → `READY`. In Qdrant Cloud,
 
 Automated tests mock S3, Gemini, Qdrant, and SQS; they do not spend provider quota or modify cloud data. The optional MySQL integration test uses rollback-only fixtures and mocked external services. Real Phase 9 end-to-end behavior must be verified using the commands above and should not be claimed until completed.
 
+## Tenant-safe RAG answers (Phase 10)
+
+Phase 10 adds a stateless, authenticated knowledge-base endpoint:
+
+```text
+POST /api/ai/ask
+  → JWT authentication and current MySQL membership/role
+  → Gemini RETRIEVAL_QUERY embedding (same model and 768 dimensions as Phase 9)
+  → Qdrant similarity query with organizationId filter inside Qdrant
+  → one tenant-scoped MySQL query retaining only READY documents
+  → bounded untrusted context
+  → grounded Gemini generation
+  → concise answer with chunk-level sources
+```
+
+OWNER, ADMIN, SUPPORT_AGENT, and VIEWER may use the endpoint because it is a read-only knowledge-base operation, matching existing document-read access. The organization always comes from `request.user.organizationId`; `organizationId` and every other unsupported request field are rejected.
+
+### Request and response
+
+The body must contain exactly one non-empty string question, trimmed and limited by `RAG_QUESTION_MAX_CHARS`:
+
+```bash
+TOKEN='REPLACE_WITH_A_VALID_JWT'
+
+curl -i -X POST http://localhost:5001/api/ai/ask \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"How long do customers have to request a refund?"}'
+```
+
+Successful grounded response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "answer": "Customers may request a refund within 30 days.",
+    "sources": [
+      {
+        "documentId": 39,
+        "fileName": "refund-policy.pdf",
+        "chunkIndex": 2
+      }
+    ]
+  }
+}
+```
+
+Responses never contain embeddings, vector database details, JWT contents, credentials, password hashes, or S3 storage keys.
+
+### Retrieval and tenant isolation
+
+The question uses Gemini's `RETRIEVAL_QUERY` task type while Phase 9 documents retain `RETRIEVAL_DOCUMENT`; both use the configured embedding model and dimension. Qdrant receives a hard server-controlled filter equivalent to `organizationId == request.user.organizationId` before similarity results are returned. There is no global search followed by application-only filtering.
+
+The API defensively rejects any returned payload whose organization does not match. It then collects the candidate document IDs and performs one MySQL query constrained by all three conditions: candidate ID, authenticated `organizationId`, and `status=READY`. Missing metadata and PENDING, PROCESSING, or FAILED documents cannot contribute context. File names returned to clients come from current MySQL metadata rather than vector payloads.
+
+Retrieval is limited to `RAG_TOP_K` (default 5) without an arbitrary score threshold. Duplicate document/chunk pairs are removed while preserving Qdrant relevance order. The complete formatted context is capped by `RAG_CONTEXT_MAX_CHARS` (default 6,000).
+
+### Grounding and prompt-injection boundary
+
+Generation defaults to the configurable stable `gemini-3.8-flash` model. A fixed system instruction requires answers to use only retrieved evidence and to report insufficient knowledge rather than use general knowledge. Retrieved chunks and the user's question are serialized as user-level data, separate from the system instruction.
+
+Uploaded documents are always untrusted reference material. The system instruction explicitly tells Gemini to ignore role changes, secret requests, system-prompt requests, or behavioral commands appearing inside a document. Application secrets are never placed in the prompt. This is an important defense boundary, though model-level prompt-injection defenses are risk reduction rather than a mathematical guarantee.
+
+If no validated chunks fit the context budget, Gemini generation is skipped and the API returns:
+
+```json
+{
+  "success": true,
+  "data": {
+    "answer": "I couldn't find enough information in the available knowledge base to answer that question.",
+    "sources": []
+  }
+}
+```
+
+Invalid requests return `400`, missing/invalid authentication returns `401`, and role rejection returns `403`. Missing configuration and temporary retrieval failures return `503`; Gemini embedding or generation failures return `502`. Provider errors are logged only by safe stage/error type and raw provider details are not returned.
+
+### Phase 10 environment
+
+Keep real values only in private `server/.env`:
+
+```env
+GEMINI_GENERATION_MODEL=gemini-3.8-flash
+RAG_TOP_K=5
+RAG_CONTEXT_MAX_CHARS=6000
+RAG_QUESTION_MAX_CHARS=2000
+```
+
+Phase 10 reuses `GEMINI_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, `QDRANT_URL`, `QDRANT_API_KEY`, and `QDRANT_COLLECTION`. No new package, Prisma model, or migration is required. The generation model default follows Google's current [Gemini model documentation](https://ai.google.dev/gemini-api/docs/models); the embedding task pairing follows the official [embeddings guidance](https://ai.google.dev/gemini-api/docs/embeddings).
+
+### Controlled real-infrastructure verification
+
+This test uses your existing MySQL, S3, SQS, worker, Gemini, and Qdrant configuration. It creates deliberately unique knowledge so the retrieved source is easy to recognize.
+
+```bash
+# Terminal 1: API
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run dev
+
+# Terminal 2: document worker
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run worker:documents
+
+# Terminal 3: create and upload controlled knowledge
+printf '%s\n' \
+  'ResolveAI Controlled Lunar Refund Policy' \
+  '' \
+  'Customers on the Lunar plan may request a refund within exactly 37 calendar days of purchase.' \
+  'The request must include the original purchase email.' \
+  > /tmp/resolveai-lunar-refund-policy.txt
+
+TOKEN='REPLACE_WITH_OWNER_OR_ADMIN_JWT'
+
+curl -i -X POST http://localhost:5001/api/documents \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'file=@/tmp/resolveai-lunar-refund-policy.txt;type=text/plain'
+```
+
+Copy the returned document ID, poll until its status is `READY`, then ask a semantic question:
+
+```bash
+DOCUMENT_ID='REPLACE_WITH_RETURNED_DOCUMENT_ID'
+
+curl -s http://localhost:5001/api/documents/$DOCUMENT_ID \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s -X POST http://localhost:5001/api/ai/ask \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What is the Lunar plan refund deadline and what must the customer provide?"}'
+```
+
+The answer should state 37 calendar days and the original purchase email, and `sources` should identify `resolveai-lunar-refund-policy.txt`. To verify tenant isolation, ask with a valid JWT from another organization; it must not retrieve this document. Do not share either token.
+
+Automated Phase 10 tests mock Gemini and Qdrant. They verify request validation, access policy, tenant-filter construction, cross-tenant payload rejection, READY filtering, missing metadata, source safety, bounded context, no-context behavior, provider failure handling, and malicious document instructions without spending cloud quota. Run the real steps above before claiming a Phase 10 cloud end-to-end test.
+
 ## 3. Configure the frontend
 
 Open a second terminal:
@@ -682,7 +823,7 @@ Run these inside `server/`:
 - `npm run dev` starts the API with nodemon and restarts it when server files change.
 - `npm start` starts the API normally.
 - `npm run worker:documents` runs the standalone long-polling SQS document worker.
-- `npm test` runs Message, Document, ingestion-service, SQS producer, and worker tests without real database or cloud writes.
-- `npm run test:integration` runs rollback-only local MySQL/API regression tests with mocked external services.
+- `npm test` runs Message, Document, ingestion, queue/worker, and Phase 10 RAG tests without real database or cloud writes.
+- `npm run test:integration` runs rollback-only local MySQL/API regression tests with mocked external services, including the authenticated Phase 10 HTTP contract.
 - `npm run prisma:generate` regenerates Prisma Client after schema changes.
 - `npm run prisma:validate` checks the Prisma schema and configuration.

@@ -14,7 +14,7 @@ import { signJwt } from "../src/utils/jwt.js";
 import { processDocumentJob } from "../src/services/documentProcessingService.js";
 
 // Opt-in: temporary fixtures use real MySQL, but every write is rolled back.
-test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked external services", {
+test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked external services", {
   skip: process.env.RUN_DB_TESTS !== "1", timeout: 90_000,
 }, async () => {
   const models = ["organization", "user", "customer", "ticket", "message", "document"];
@@ -27,6 +27,7 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
   const originalRegion = env.awsRegion;
   const originalBucket = env.awsS3Bucket;
   const originalQueueUrl = env.awsSqsDocumentQueueUrl;
+  const originalRagDependencies = app.locals.ragDependencies;
   const saved = [];
   let httpServer;
   try {
@@ -65,6 +66,37 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
         env.awsRegion = "us-east-1";
         env.awsS3Bucket = "phase7-test-bucket";
         env.awsSqsDocumentQueueUrl = "https://sqs.example/resolveai-document-processing";
+        const aiCalls = [];
+        app.locals.ragDependencies = {
+          config: {
+            apiKey: "integration-test-key",
+            qdrantUrl: "https://qdrant.invalid",
+            collection: "integration-documents",
+            dimension: 3,
+            generationModel: "integration-model",
+            questionMaxChars: 2_000,
+            topK: 5,
+            contextMaxChars: 1_200,
+          },
+          embedQuery: async (question) => {
+            aiCalls.push({ stage: "embedding", question });
+            return [1, 0, 0];
+          },
+          searchReadyDocumentChunks: async (organizationId) => {
+            aiCalls.push({ stage: "retrieval", organizationId });
+            return [{
+              documentId: document.id,
+              fileName: document.fileName,
+              chunkIndex: 0,
+              text: "The controlled refund window is 30 days.",
+              score: 0.95,
+            }];
+          },
+          generateGroundedAnswer: async (question, context) => {
+            aiCalls.push({ stage: "generation", question, hasContext: context.includes("30 days") });
+            return "The refund window is 30 days.";
+          },
+        };
         const s3Commands = [];
         const sqsCommands = [];
         s3Client.send = async (command) => { s3Commands.push(command); return {}; };
@@ -113,6 +145,7 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
         await request("/auth/me", 200, registered.data.token);
         await request(path, 401);
         await request("/documents", 401);
+        await request("/ai/ask", 401, undefined, "POST", { question: "What is the refund window?" });
         await request(path, 401, "invalid-token");
         await request(path, 401, signJwt({ userId: 2_147_483_647, organizationId: org.id, role: "OWNER" }));
         for (const role of Object.keys(members)) {
@@ -126,6 +159,14 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
           await request(path, 200, tokens[role]);
           await request("/documents", 200, tokens[role]);
           await request(`/documents/${document.id}`, 200, tokens[role]);
+          const aiResponse = await request("/ai/ask", 200, tokens[role], "POST", {
+            question: "What is the refund window?",
+          });
+          assert.equal(aiResponse.data.answer, "The refund window is 30 days.");
+          assert.deepEqual(aiResponse.data.sources, [{
+            documentId: document.id, fileName: document.fileName, chunkIndex: 0,
+          }]);
+          assert.equal(JSON.stringify(aiResponse).includes("storageKey"), false);
           await request(path, role === "VIEWER" ? 403 : 201, tokens[role], "POST", {
             content: `  ${role} message  `, organizationId: otherOrg.id, userId: otherUser.id,
             ticketId: otherTicket.id, customerId: otherCustomer.id, senderType: "AI",
@@ -141,6 +182,15 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
             }
           });
         }
+        await request("/ai/ask", 400, tokens.OWNER, "POST", {});
+        await request("/ai/ask", 400, tokens.OWNER, "POST", { question: "   " });
+        await request("/ai/ask", 400, tokens.OWNER, "POST", { question: "a".repeat(2_001) });
+        await request("/ai/ask", 400, tokens.OWNER, "POST", {
+          question: "What is the refund window?", organizationId: otherOrg.id,
+        });
+        assert.equal(aiCalls.filter((call) => call.stage === "retrieval").length, 4);
+        assert.ok(aiCalls.filter((call) => call.stage === "retrieval").every((call) => call.organizationId === org.id));
+        assert.ok(aiCalls.filter((call) => call.stage === "generation").every((call) => call.hasContext));
         const textUpload = { name: "../../tenant/notes.txt", blob: new Blob(["Phase 7 text"], { type: "text/plain" }) };
         for (const role of ["OWNER", "ADMIN"]) {
           const uploaded = await upload(201, tokens[role], textUpload, { organizationId: otherOrg.id });
@@ -296,6 +346,8 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
       env.awsRegion = originalRegion;
       env.awsS3Bucket = originalBucket;
       env.awsSqsDocumentQueueUrl = originalQueueUrl;
+      if (originalRagDependencies === undefined) delete app.locals.ragDependencies;
+      else app.locals.ragDependencies = originalRagDependencies;
       if (httpServer) await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
     }
     assert.deepEqual(await counts(), before, "all fixture writes must be rolled back");
@@ -305,6 +357,8 @@ test("Phase 0–9 API regression with rollback-only MySQL fixtures and mocked ex
     env.awsRegion = originalRegion;
     env.awsS3Bucket = originalBucket;
     env.awsSqsDocumentQueueUrl = originalQueueUrl;
+    if (originalRagDependencies === undefined) delete app.locals.ragDependencies;
+    else app.locals.ragDependencies = originalRagDependencies;
     await prisma.$disconnect();
   }
 });

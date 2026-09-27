@@ -4,7 +4,7 @@ import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { bodyToBuffer, downloadDocument } from "../src/services/documentStorageService.js";
 import { extractDocumentText, normalizeDocumentText } from "../src/services/documentExtractionService.js";
 import { chunkDocumentText } from "../src/services/documentChunkingService.js";
-import { embedTexts } from "../src/services/embeddingService.js";
+import { embedQuery, embedTexts } from "../src/services/embeddingService.js";
 import {
   deterministicPointId,
   ensureDocumentCollection,
@@ -150,6 +150,19 @@ test("embedding batching and response validation", async (context) => {
       client: { models: { embedContent: async () => { throw transient; } } },
       apiKey: "test", model: "test", dimension: 3,
     }), (error) => error === transient);
+  });
+
+  await context.test("uses the compatible retrieval-query task for questions", async () => {
+    let request;
+    const vector = await embedQuery("What is the refund policy?", {
+      client: { models: { embedContent: async (value) => {
+        request = value;
+        return { embeddings: [{ values: [1, 0, 0] }] };
+      } } },
+      apiKey: "test", model: "test", dimension: 3,
+    });
+    assert.deepEqual(vector, [1, 0, 0]);
+    assert.equal(request.config.taskType, "RETRIEVAL_QUERY");
   });
 });
 

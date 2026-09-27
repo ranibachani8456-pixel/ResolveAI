@@ -6,6 +6,7 @@ function embeddingConfiguration(overrides = {}) {
   const model = overrides.model ?? env.embeddingModel;
   const dimension = overrides.dimension ?? env.embeddingDimension;
   const batchSize = overrides.batchSize ?? env.embeddingBatchSize;
+  const taskType = overrides.taskType ?? "RETRIEVAL_DOCUMENT";
   if (!apiKey || !model) throw new Error("Embedding worker configuration is missing");
   if (!Number.isInteger(dimension) || dimension <= 0 || dimension > 3_072) {
     throw new Error("EMBEDDING_DIMENSION must be an integer from 1 to 3072");
@@ -13,7 +14,10 @@ function embeddingConfiguration(overrides = {}) {
   if (!Number.isInteger(batchSize) || batchSize <= 0 || batchSize > 100) {
     throw new Error("EMBEDDING_BATCH_SIZE must be an integer from 1 to 100");
   }
-  return { apiKey, model, dimension, batchSize };
+  if (!["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"].includes(taskType)) {
+    throw new Error("Embedding task type is unsupported");
+  }
+  return { apiKey, model, dimension, batchSize, taskType };
 }
 
 export async function embedTexts(texts, overrides = {}) {
@@ -29,7 +33,7 @@ export async function embedTexts(texts, overrides = {}) {
       model: configuration.model,
       contents: batch,
       config: {
-        taskType: "RETRIEVAL_DOCUMENT",
+        taskType: configuration.taskType,
         outputDimensionality: configuration.dimension,
       },
     });
@@ -48,4 +52,11 @@ export async function embedTexts(texts, overrides = {}) {
     }
   }
   return vectors;
+}
+
+// Query embeddings share the exact model and dimension used for indexed documents,
+// but use Gemini's retrieval-query task so asymmetric semantic search stays compatible.
+export async function embedQuery(text, overrides = {}) {
+  const [vector] = await embedTexts([text], { ...overrides, taskType: "RETRIEVAL_QUERY" });
+  return vector;
 }
