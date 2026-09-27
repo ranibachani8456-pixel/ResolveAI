@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 10, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, and tenant-safe grounded knowledge-base answers using Gemini.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 11, it includes a React/Express foundation, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
 
 ## Project structure
 
@@ -10,11 +10,11 @@ ResolveAi/
 └── server/   # Node.js + Express API
 ```
 
-Conversation memory, automatic ticket replies, Redis, streaming, frontend AI UI, and advanced ticket workflows are intentionally not implemented yet. Phase 10 provides only stateless question → retrieval → grounded answer behavior.
+Automatic ticket replies, Redis, streaming, frontend AI UI, reranking, hybrid search, and advanced ticket workflows are intentionally not implemented yet. Phase 11 adds persistent conversations while preserving Phase 10's stateless endpoint.
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, and grounded RAG answers are configured through Phase 10:
+The following technologies describe the planned stack. React/Express, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, grounded RAG answers, and persistent AI conversations are configured through Phase 11:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -81,6 +81,8 @@ QDRANT_COLLECTION=resolveai_documents
 RAG_TOP_K=5
 RAG_CONTEXT_MAX_CHARS=6000
 RAG_QUESTION_MAX_CHARS=2000
+AI_HISTORY_MAX_MESSAGES=10
+AI_HISTORY_MAX_CHARS=6000
 DOCUMENT_PROCESSING_LEASE_SECONDS=240
 ```
 
@@ -791,6 +793,151 @@ The answer should state 37 calendar days and the original purchase email, and `s
 
 Automated Phase 10 tests mock Gemini and Qdrant. They verify request validation, access policy, tenant-filter construction, cross-tenant payload rejection, READY filtering, missing metadata, source safety, bounded context, no-context behavior, provider failure handling, and malicious document instructions without spending cloud quota. Run the real steps above before claiming a Phase 10 cloud end-to-end test.
 
+## Persistent AI conversations (Phase 11)
+
+Phase 11 keeps `POST /api/ai/ask` backward compatible and adds persistent, creator-owned conversations:
+
+```text
+authenticated conversation message
+  → tenant + creator scoped conversation lookup
+  → bounded recent MySQL history
+  → fresh Phase 10 RETRIEVAL_QUERY embedding
+  → Qdrant search with the mandatory organizationId filter
+  → tenant-scoped READY-document validation in MySQL
+  → bounded retrieved context + untrusted bounded history
+  → grounded Gemini answer
+  → atomic USER + ASSISTANT message insert and conversation timestamp update
+```
+
+All four established read-only AI roles—OWNER, ADMIN, SUPPORT_AGENT, and VIEWER—may use these routes:
+
+| Endpoint | Body | Result |
+| --- | --- | --- |
+| `POST /api/ai/conversations` | `{}` or `{ "title": "Refund questions" }` | Creates a conversation and returns `201` |
+| `GET /api/ai/conversations` | none | Lists the authenticated user's conversations, `updatedAt DESC, id DESC`, without messages |
+| `GET /api/ai/conversations/:conversationId` | none | Returns the conversation and up to the 100 most recent messages in chronological order |
+| `POST /api/ai/conversations/:conversationId/messages` | `{ "question": "..." }` | Runs fresh grounded RAG, persists one message pair, and returns `201` with answer, sources, USER message, and ASSISTANT message |
+
+Bodies accept only the documented fields. Clients cannot provide an organization, creator, message role, assistant content, context, sources, or system prompt. Titles are optional non-empty strings up to 191 characters. Questions use the existing `RAG_QUESTION_MAX_CHARS` validation.
+
+### Tenant and conversation ownership
+
+Organization and user identity come only from the current membership loaded by `authMiddleware`. Every conversation read or write uses the combination of `conversationId`, `request.user.organizationId`, and `request.user.userId`. A missing ID, another user's ID, and another tenant's ID all return the same `404 Conversation not found`, so the API does not reveal resource existence. Conversation lists are also filtered by both organization and creator.
+
+This creator-owned policy means even an OWNER or ADMIN cannot inspect another member's AI conversation. The Qdrant query still applies the server-side integer `organizationId` payload filter required by Qdrant Cloud strict mode. Candidate vector payloads are defensively tenant-checked, and only READY documents from the same MySQL organization may reach generation.
+
+### Bounded history, grounding, and persistence
+
+Only the newest `AI_HISTORY_MAX_MESSAGES` messages are considered, and their combined content is capped by `AI_HISTORY_MAX_CHARS`. The default limits are 10 messages and 6,000 characters. Prior USER and ASSISTANT messages are serialized as untrusted user-level contextual data, separate from the trusted system instruction and clearly separate from the current question. History may clarify references, but retrieved READY knowledge remains the sole authority for company facts. Every turn performs fresh retrieval; memory never replaces Qdrant.
+
+The trusted instruction explicitly rejects role changes, system-prompt requests, credential/API-key requests, tenant-isolation bypasses, and grounding overrides found in documents, history, or questions. Application credentials, JWTs, password hashes, S3 keys, vectors, and internal prompts are never selected into the generation payload or returned by the API. Prompt-injection defenses reduce risk but cannot mathematically guarantee model behavior.
+
+Retrieval and generation complete before message persistence. On success, USER and ASSISTANT rows are inserted together in one MySQL transaction and the conversation's `updatedAt` is refreshed. If embedding, retrieval, or generation fails, neither message is stored. If the persistence transaction fails, it rolls back both rows. Source metadata remains response-only and is not duplicated in MySQL.
+
+Expected errors follow existing conventions: `400` invalid input, `401` missing/invalid authentication, `403` unsupported role, `404` inaccessible conversation, `502` Gemini embedding/generation failure, `503` retrieval or configuration failure, and a generic `500` for unexpected persistence errors. Raw provider errors and secrets are never returned.
+
+### Phase 11 environment and migration
+
+Keep these values in private `server/.env`; the shown defaults are also in the safe `.env.example`:
+
+```env
+AI_HISTORY_MAX_MESSAGES=10
+AI_HISTORY_MAX_CHARS=6000
+```
+
+`AI_HISTORY_MAX_MESSAGES` must be an integer from 1 through 50. `AI_HISTORY_MAX_CHARS` must be an integer from 500 through 50,000. Apply the new migration and regenerate Prisma Client before starting the API:
+
+```bash
+cd /Users/ranib/Desktop/ResolveAi/server
+npx prisma migrate dev
+npm run prisma:generate
+npm run prisma:validate
+npx prisma migrate status
+```
+
+The migration creates `AIConversation`, `AIMessage`, and the `AIMessageRole` enum represented in MySQL as `USER`/`ASSISTANT`, with tenant/creator, updated-time, and chronological-message indexes. Old migrations are unchanged.
+
+### Real Phase 11 verification with the existing Lunar document
+
+These commands use existing READY document `54`; do not upload it again. Start MySQL and the backend first. The worker is unnecessary when document 54 is already READY in MySQL and its vectors remain in Qdrant.
+
+```bash
+# Terminal 1
+cd /Users/ranib/Desktop/ResolveAi/server
+npm run dev
+
+# Terminal 2
+BASE_URL='http://localhost:5001/api'
+
+# Use your real organization slug, email, and password. Copy data.token from the response.
+curl -s -X POST "$BASE_URL/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationSlug":"YOUR_ORG_SLUG","email":"YOUR_EMAIL","password":"YOUR_PASSWORD"}'
+
+TOKEN='PASTE_DATA_TOKEN_HERE'
+
+# Confirm document 54 is still READY for this tenant.
+curl -s "$BASE_URL/documents/54" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Create the conversation. Copy data.conversation.id from the response.
+curl -s -X POST "$BASE_URL/ai/conversations" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Lunar refund follow-up"}'
+
+CONVERSATION_ID='PASTE_CONVERSATION_ID_HERE'
+
+# Expected: a grounded answer stating 37 calendar days and source documentId 54.
+curl -s -X POST "$BASE_URL/ai/conversations/$CONVERSATION_ID/messages" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What is the Lunar plan refund deadline?"}'
+
+# Same conversation. Expected: original purchase email and source documentId 54.
+curl -s -X POST "$BASE_URL/ai/conversations/$CONVERSATION_ID/messages" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What does the customer need to provide?"}'
+
+# Expected chronological roles: USER, ASSISTANT, USER, ASSISTANT.
+curl -s "$BASE_URL/ai/conversations/$CONVERSATION_ID" \
+  -H "Authorization: Bearer $TOKEN"
+
+# The list response must not include messages.
+curl -s "$BASE_URL/ai/conversations" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Verify persistence in MySQL Workbench using the returned conversation ID:
+
+```sql
+SELECT id, organizationId, createdByUserId, title, createdAt, updatedAt
+FROM AIConversation
+WHERE id = YOUR_CONVERSATION_ID;
+
+SELECT id, conversationId, role, content, createdAt
+FROM AIMessage
+WHERE conversationId = YOUR_CONVERSATION_ID
+ORDER BY createdAt ASC, id ASC;
+```
+
+For a practical isolation check, log in as a user from a different organization, copy that JWT into `OTHER_TENANT_TOKEN`, and request the first tenant's ID. Both calls must return `404` without conversation data:
+
+```bash
+OTHER_TENANT_TOKEN='PASTE_OTHER_TENANT_JWT_HERE'
+
+curl -i "$BASE_URL/ai/conversations/$CONVERSATION_ID" \
+  -H "Authorization: Bearer $OTHER_TENANT_TOKEN"
+
+curl -i -X POST "$BASE_URL/ai/conversations/$CONVERSATION_ID/messages" \
+  -H "Authorization: Bearer $OTHER_TENANT_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"Do not reveal another tenant conversation"}'
+```
+
+Automated tests mock Gemini, Qdrant, S3, and SQS where appropriate. The rollback-only integration test requires migrated local MySQL. Known Phase 11 limitations: no pagination cursor beyond the safe 100-message detail limit, no source persistence, no retry idempotency key, no concurrent-turn serialization, no deletion/renaming endpoint, no streaming/WebSockets, and no frontend chat UI.
+
 ## 3. Configure the frontend
 
 Open a second terminal:
@@ -823,7 +970,7 @@ Run these inside `server/`:
 - `npm run dev` starts the API with nodemon and restarts it when server files change.
 - `npm start` starts the API normally.
 - `npm run worker:documents` runs the standalone long-polling SQS document worker.
-- `npm test` runs Message, Document, ingestion, queue/worker, and Phase 10 RAG tests without real database or cloud writes.
-- `npm run test:integration` runs rollback-only local MySQL/API regression tests with mocked external services, including the authenticated Phase 10 HTTP contract.
+- `npm test` runs Message, Document, ingestion, queue/worker, Phase 10 RAG, and Phase 11 conversation tests without real database or cloud writes.
+- `npm run test:integration` runs rollback-only local MySQL/API regression tests with mocked external services, including authenticated Phase 10 and Phase 11 HTTP contracts.
 - `npm run prisma:generate` regenerates Prisma Client after schema changes.
 - `npm run prisma:validate` checks the Prisma schema and configuration.

@@ -80,7 +80,7 @@ function sourcesFrom(items) {
   return items.map(({ documentId, fileName, chunkIndex }) => ({ documentId, fileName, chunkIndex }));
 }
 
-export async function answerKnowledgeQuestion(identity, input, dependencies = {}) {
+export async function answerKnowledgeQuestion(identity, input, dependencies = {}, options = {}) {
   const questionMaxChars = dependencies.config?.questionMaxChars ?? env.ragQuestionMaxChars;
   if (!Number.isInteger(questionMaxChars) || questionMaxChars < 100 || questionMaxChars > 10_000) {
     throw new RagServiceError(503, "AI service is not configured", "configuration");
@@ -128,7 +128,12 @@ export async function answerKnowledgeQuestion(identity, input, dependencies = {}
     answer = await (dependencies.generateGroundedAnswer ?? generateGroundedAnswer)(
       question,
       bounded.context,
-      { ...dependencies.generation, apiKey: settings.apiKey, model: settings.generationModel },
+      {
+        ...dependencies.generation,
+        apiKey: settings.apiKey,
+        model: settings.generationModel,
+        history: options.history ?? [],
+      },
     );
   } catch (error) {
     throw new RagServiceError(502, "Unable to generate a grounded answer", "generation", error);

@@ -43,31 +43,38 @@ enum DocumentStatus {
   FAILED
 }
 
+enum AIMessageRole {
+  USER
+  ASSISTANT
+}
+
 model Organization {
-  id        Int        @id @default(autoincrement())
-  name      String     @db.VarChar(191)
-  slug      String     @unique @db.VarChar(191)
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
-  users     User[]
-  customers Customer[]
-  tickets   Ticket[]
-  messages  Message[]
-  documents Document[]
+  id              Int              @id @default(autoincrement())
+  name            String           @db.VarChar(191)
+  slug            String           @unique @db.VarChar(191)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  users           User[]
+  customers       Customer[]
+  tickets         Ticket[]
+  messages        Message[]
+  documents       Document[]
+  aiConversations AIConversation[]
 }
 
 model User {
-  id              Int          @id @default(autoincrement())
+  id              Int              @id @default(autoincrement())
   organizationId  Int
-  name            String       @db.VarChar(191)
-  email           String       @db.VarChar(191)
-  passwordHash    String       @db.VarChar(255)
+  name            String           @db.VarChar(191)
+  email           String           @db.VarChar(191)
+  passwordHash    String           @db.VarChar(255)
   role            Role
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
-  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  assignedTickets Ticket[]     @relation("TicketAssignee")
-  messages        Message[]    @relation("UserMessages")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assignedTickets Ticket[]         @relation("TicketAssignee")
+  messages        Message[]        @relation("UserMessages")
+  aiConversations AIConversation[] @relation("AIConversationCreator")
 
   // This unique index also supports queries scoped by organizationId.
   @@unique([organizationId, email])
@@ -139,4 +146,30 @@ model Document {
   organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([organizationId, status])
+}
+
+model AIConversation {
+  id              Int          @id @default(autoincrement())
+  organizationId  Int
+  createdByUserId Int
+  title           String?      @db.VarChar(191)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy       User         @relation("AIConversationCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  messages        AIMessage[]
+
+  @@index([organizationId, createdByUserId, updatedAt])
+  @@index([organizationId, id])
+}
+
+model AIMessage {
+  id             Int            @id @default(autoincrement())
+  conversationId Int
+  role           AIMessageRole
+  content        String         @db.Text
+  createdAt      DateTime       @default(now())
+  conversation   AIConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt, id])
 }

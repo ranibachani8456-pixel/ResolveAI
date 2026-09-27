@@ -22,5 +22,7 @@ export const env = {
   ragTopK: Number(process.env.RAG_TOP_K || 5),
   ragContextMaxChars: Number(process.env.RAG_CONTEXT_MAX_CHARS || 6_000),
   ragQuestionMaxChars: Number(process.env.RAG_QUESTION_MAX_CHARS || 2_000),
+  aiHistoryMaxMessages: Number(process.env.AI_HISTORY_MAX_MESSAGES || 10),
+  aiHistoryMaxChars: Number(process.env.AI_HISTORY_MAX_CHARS || 6_000),
   documentProcessingLeaseSeconds: Number(process.env.DOCUMENT_PROCESSING_LEASE_SECONDS || 240),
 };

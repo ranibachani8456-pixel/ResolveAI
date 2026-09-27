@@ -12,12 +12,13 @@ import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import { env } from "../src/config/env.js";
 import { signJwt } from "../src/utils/jwt.js";
 import { processDocumentJob } from "../src/services/documentProcessingService.js";
+import { RagServiceError } from "../src/services/ragService.js";
 
 // Opt-in: temporary fixtures use real MySQL, but every write is rolled back.
-test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked external services", {
+test("Phase 0–11 API regression with rollback-only MySQL fixtures and mocked external services", {
   skip: process.env.RUN_DB_TESTS !== "1", timeout: 90_000,
 }, async () => {
-  const models = ["organization", "user", "customer", "ticket", "message", "document"];
+  const models = ["organization", "user", "customer", "ticket", "message", "document", "aIConversation", "aIMessage"];
   const counts = () => Promise.all(models.map((name) => prisma[name].count()));
   const before = await counts();
   const rollback = new Error("Intentional fixture rollback");
@@ -28,6 +29,7 @@ test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked e
   const originalBucket = env.awsS3Bucket;
   const originalQueueUrl = env.awsSqsDocumentQueueUrl;
   const originalRagDependencies = app.locals.ragDependencies;
+  const originalAIConversationDependencies = app.locals.aiConversationDependencies;
   const saved = [];
   let httpServer;
   try {
@@ -146,8 +148,11 @@ test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked e
         await request(path, 401);
         await request("/documents", 401);
         await request("/ai/ask", 401, undefined, "POST", { question: "What is the refund window?" });
+        await request("/ai/conversations", 401);
+        await request("/ai/conversations", 401, undefined, "POST", {});
         await request(path, 401, "invalid-token");
         await request(path, 401, signJwt({ userId: 2_147_483_647, organizationId: org.id, role: "OWNER" }));
+        let ownerConversationId;
         for (const role of Object.keys(members)) {
           await request("/auth/me", 200, tokens[role]);
           await request("/organization", 200, tokens[role]);
@@ -167,6 +172,34 @@ test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked e
             documentId: document.id, fileName: document.fileName, chunkIndex: 0,
           }]);
           assert.equal(JSON.stringify(aiResponse).includes("storageKey"), false);
+          const createdConversation = await request("/ai/conversations", 201, tokens[role], "POST", {
+            title: `${role} refund questions`,
+          });
+          const conversationId = createdConversation.data.conversation.id;
+          if (role === "OWNER") ownerConversationId = conversationId;
+          assert.equal(createdConversation.data.conversation.organizationId, org.id);
+          assert.equal(createdConversation.data.conversation.createdByUserId, members[role].id);
+          const conversationAnswer = await request(
+            `/ai/conversations/${conversationId}/messages`,
+            201,
+            tokens[role],
+            "POST",
+            { question: "What is the refund window?" },
+          );
+          assert.equal(conversationAnswer.data.answer, "The refund window is 30 days.");
+          assert.equal(conversationAnswer.data.userMessage.role, "USER");
+          assert.equal(conversationAnswer.data.assistantMessage.role, "ASSISTANT");
+          assert.deepEqual(conversationAnswer.data.sources, [{
+            documentId: document.id, fileName: document.fileName, chunkIndex: 0,
+          }]);
+          const fetchedConversation = await request(`/ai/conversations/${conversationId}`, 200, tokens[role]);
+          assert.deepEqual(
+            fetchedConversation.data.conversation.messages.map(({ role }) => role),
+            ["USER", "ASSISTANT"],
+          );
+          const conversationList = await request("/ai/conversations", 200, tokens[role]);
+          assert.ok(conversationList.data.conversations.some(({ id }) => id === conversationId));
+          assert.equal("messages" in conversationList.data.conversations[0], false);
           await request(path, role === "VIEWER" ? 403 : 201, tokens[role], "POST", {
             content: `  ${role} message  `, organizationId: otherOrg.id, userId: otherUser.id,
             ticketId: otherTicket.id, customerId: otherCustomer.id, senderType: "AI",
@@ -188,7 +221,43 @@ test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked e
         await request("/ai/ask", 400, tokens.OWNER, "POST", {
           question: "What is the refund window?", organizationId: otherOrg.id,
         });
-        assert.equal(aiCalls.filter((call) => call.stage === "retrieval").length, 4);
+        await request("/ai/conversations", 400, tokens.OWNER, "POST", { organizationId: otherOrg.id });
+        await request(`/ai/conversations/${ownerConversationId}/messages`, 400, tokens.OWNER, "POST", {
+          question: "Valid question", role: "ASSISTANT",
+        });
+        await request("/ai/conversations/not-an-id", 400, tokens.OWNER);
+        await request("/ai/conversations/2147483647", 404, tokens.OWNER);
+
+        const otherConversation = await transaction.aIConversation.create({ data: {
+          organizationId: otherOrg.id,
+          createdByUserId: otherUser.id,
+          title: "Other tenant conversation",
+        } });
+        await request(`/ai/conversations/${otherConversation.id}`, 404, tokens.OWNER);
+        await request(`/ai/conversations/${otherConversation.id}/messages`, 404, tokens.OWNER, "POST", {
+          question: "Do not leak this conversation",
+        });
+        await request(`/ai/conversations/${otherConversation.id}`, 200, otherToken);
+
+        const messageCountBeforeGenerationFailure = await transaction.aIMessage.count({
+          where: { conversationId: ownerConversationId },
+        });
+        app.locals.aiConversationDependencies = {
+          ragDependencies: app.locals.ragDependencies,
+          answerKnowledgeQuestion: async () => {
+            throw new RagServiceError(502, "Unable to generate a grounded answer", "generation");
+          },
+        };
+        await request(`/ai/conversations/${ownerConversationId}/messages`, 502, tokens.OWNER, "POST", {
+          question: "This generation must fail",
+        });
+        assert.equal(
+          await transaction.aIMessage.count({ where: { conversationId: ownerConversationId } }),
+          messageCountBeforeGenerationFailure,
+        );
+        delete app.locals.aiConversationDependencies;
+
+        assert.equal(aiCalls.filter((call) => call.stage === "retrieval").length, 8);
         assert.ok(aiCalls.filter((call) => call.stage === "retrieval").every((call) => call.organizationId === org.id));
         assert.ok(aiCalls.filter((call) => call.stage === "generation").every((call) => call.hasContext));
         const textUpload = { name: "../../tenant/notes.txt", blob: new Blob(["Phase 7 text"], { type: "text/plain" }) };
@@ -348,6 +417,8 @@ test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked e
       env.awsSqsDocumentQueueUrl = originalQueueUrl;
       if (originalRagDependencies === undefined) delete app.locals.ragDependencies;
       else app.locals.ragDependencies = originalRagDependencies;
+      if (originalAIConversationDependencies === undefined) delete app.locals.aiConversationDependencies;
+      else app.locals.aiConversationDependencies = originalAIConversationDependencies;
       if (httpServer) await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
     }
     assert.deepEqual(await counts(), before, "all fixture writes must be rolled back");
@@ -359,6 +430,8 @@ test("Phase 0–10 API regression with rollback-only MySQL fixtures and mocked e
     env.awsSqsDocumentQueueUrl = originalQueueUrl;
     if (originalRagDependencies === undefined) delete app.locals.ragDependencies;
     else app.locals.ragDependencies = originalRagDependencies;
+    if (originalAIConversationDependencies === undefined) delete app.locals.aiConversationDependencies;
+    else app.locals.aiConversationDependencies = originalAIConversationDependencies;
     await prisma.$disconnect();
   }
 });
