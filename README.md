@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 12, it includes a production-style React support dashboard backed by the existing Express API, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 12 and its support-intake extension, it includes a public customer-to-agent ticket flow, a production-style React support dashboard backed by the existing Express API, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
 
 ## Project structure
 
@@ -361,10 +361,11 @@ npx prisma migrate status
 | `POST /api/documents` | OWNER, ADMIN |
 | `GET /api/documents` | OWNER, ADMIN, SUPPORT_AGENT, VIEWER |
 | `GET /api/documents/:documentId` | OWNER, ADMIN, SUPPORT_AGENT, VIEWER |
+| `GET /api/documents/:documentId/content` | OWNER, ADMIN, SUPPORT_AGENT, VIEWER |
 
 POST accepts exactly one `multipart/form-data` field named `file`. PDF (`application/pdf`) and UTF-8 plain text (`text/plain`) are supported, up to 10 MB. Empty, oversized, unsupported, and content-type-spoofed files are rejected. The authenticated organization—not request body data—controls ownership.
 
-S3 privately stores the file bytes; MySQL stores safe metadata with status `PENDING`, then SQS requests Phase 9 ingestion. Keys are generated as `organizations/{authenticatedOrganizationId}/documents/{UUID}-{sanitizedFilename}`. No public-read ACL is set and API responses do not reveal the storage key.
+S3 privately stores the file bytes; MySQL stores safe metadata with status `PENDING`, then SQS requests Phase 9 ingestion. Keys are generated as `organizations/{authenticatedOrganizationId}/documents/{UUID}-{sanitizedFilename}`. No public-read ACL is set and API responses do not reveal the storage key. The authenticated content endpoint performs a tenant-scoped metadata lookup and serves the bounded private object through the API with `private, no-store` caching; it never returns an S3 key or public URL.
 
 Configure a private S3 bucket and AWS region. Credentials are intentionally absent from `.env.example`: the AWS SDK uses its normal provider chain, such as a local AWS profile or an IAM role in AWS.
 
@@ -373,7 +374,7 @@ AWS_REGION=us-east-1
 AWS_S3_BUCKET=your-private-resolveai-documents-bucket
 ```
 
-The runtime identity needs `s3:PutObject` and `s3:DeleteObject` only for the bucket's `organizations/*/documents/*` prefix. Keep public access blocked and enable bucket encryption. `DeleteObject` is required because if S3 succeeds but MySQL metadata creation fails, the API makes a best-effort compensating delete. S3 and MySQL cannot form one atomic transaction; a failed cleanup is logged and can leave an orphan requiring operational cleanup.
+The runtime identity needs `s3:PutObject`, `s3:GetObject`, and `s3:DeleteObject` only for the bucket's `organizations/*/documents/*` prefix. `GetObject` supports authenticated ingestion and previews; it does not make objects public. Keep public access blocked and enable bucket encryption. `DeleteObject` is required because if S3 succeeds but MySQL metadata creation fails, the API makes a best-effort compensating delete. S3 and MySQL cannot form one atomic transaction; a failed cleanup is logged and can leave an orphan requiring operational cleanup.
 
 ```bash
 BASE_URL=http://localhost:5001/api
@@ -389,6 +390,7 @@ curl -i -X POST "$BASE_URL/documents" \
 
 curl -i "$BASE_URL/documents" -H "Authorization: Bearer $READER_TOKEN"
 curl -i "$BASE_URL/documents/$DOCUMENT_ID" -H "Authorization: Bearer $READER_TOKEN"
+curl -i "$BASE_URL/documents/$DOCUMENT_ID/content" -H "Authorization: Bearer $READER_TOKEN" -o preview-response.bin
 
 # Missing file, unsupported type, and malformed ID should return 400.
 curl -i -X POST "$BASE_URL/documents" -H "Authorization: Bearer $OWNER_TOKEN" -F "note=no-file"
@@ -940,7 +942,7 @@ Automated tests mock Gemini, Qdrant, S3, and SQS where appropriate. The rollback
 
 ## Production support dashboard (Phase 12)
 
-Phase 12 replaces the original health-check screen with a responsive authenticated workspace. It uses only existing backend endpoints; no server routes, database models, or Phase 13 capabilities were added.
+Phase 12 replaces the original health-check screen with a responsive authenticated workspace. Its support-intake extension adds one deliberately public, narrowly scoped endpoint while preserving all authenticated backend routes, database models, and Phase 13 boundaries.
 
 ### Frontend architecture
 
@@ -950,7 +952,7 @@ client/src/
 ├── components/   # shared controls, feedback states, and application shell
 ├── constants/    # role and ticket display metadata
 ├── context/      # reducer-based authentication and toast state
-├── features/     # auth, dashboard, tickets, customers, knowledge, AI, and team pages
+├── features/     # auth, public support, dashboard, tickets, customers, knowledge, AI, and team pages
 ├── hooks/        # context access hooks
 ├── test/         # Vitest and Testing Library setup
 └── utils/        # date, name, and text formatting helpers
@@ -966,6 +968,7 @@ Major pages are lazy-loaded with `React.lazy` and `Suspense`. Lists, derived das
 | --- | --- |
 | `/login` | Organization-aware sign in |
 | `/register` | Create an organization and its first owner |
+| `/support/:organizationSlug` | Public customer support intake without the internal application shell |
 | `/app/dashboard` | Ticket overview and recent activity derived from the ticket list |
 | `/app/tickets` | Filter, inspect, create, and update tickets |
 | `/app/tickets/:ticketId` | Ticket detail, assignment/status editing, and conversation messages |
@@ -980,6 +983,8 @@ The UI reflects the backend's role policy rather than inventing new authorizatio
 ### Knowledge and AI behavior
 
 Knowledge uploads accept PDF or plain-text files up to 10 MB before sending multipart data. Documents in `PENDING` or `PROCESSING` are refreshed every five seconds with a non-overlapping timer. Polling stops when no documents are in progress, after two minutes, or when the page unmounts. Terminal `READY` and `FAILED` states remain visible; the current API intentionally exposes status but no internal failure details.
+
+Each document row also has a secure Preview action. Plain text is rendered as escaped text and PDFs use the browser's built-in PDF viewer backed by a short-lived browser object URL that is revoked on close or unmount. Preview bytes come from the authenticated, organization-scoped API endpoint; private S3 keys and URLs remain server-side.
 
 The AI workspace lists creator-owned conversations, loads persisted chronological messages, creates conversations, and sends one guarded question at a time. Each response is rendered as plain React text, never injected HTML. Source cards are shown for the current response because Phase 11 intentionally does not persist sources. The most recently selected conversation ID is kept in session storage for convenient same-tab navigation.
 
@@ -1011,12 +1016,75 @@ The focused test suite covers centralized API behavior and auth headers, protect
 4. Start the frontend in a third terminal: `cd client && npm run dev`, then open `http://localhost:5173`.
 5. Register a new organization or sign in with an existing organization slug and account; refresh a protected page and confirm `/api/auth/me` restores the session.
 6. Open the dashboard, customers, and tickets. Create a customer and ticket, open the ticket, update supported properties, and send a message as OWNER, ADMIN, or SUPPORT_AGENT.
-7. Open Knowledge as OWNER or ADMIN, upload one `.txt` or text-based `.pdf` file smaller than 10 MB, and watch `PENDING` progress through `PROCESSING` to `READY` (or show `FAILED`). Confirm unsupported and oversized files are rejected before upload.
+7. Open Knowledge as OWNER or ADMIN, upload one `.txt` or text-based `.pdf` file smaller than 10 MB, and watch `PENDING` progress through `PROCESSING` to `READY` (or show `FAILED`). Confirm unsupported and oversized files are rejected before upload, then use Preview and verify the private text or PDF opens in the modal.
 8. Open AI Assistant, create a conversation, ask a question grounded in the READY document, and ask a follow-up. Confirm the latest sources are shown and the conversation persists after refresh.
 9. As OWNER, edit a team member role. Confirm ADMIN can view and add members but cannot change roles; confirm SUPPORT_AGENT and VIEWER do not receive team navigation.
 10. Log out and confirm protected routes return to `/login`. Repeat key flows with a VIEWER account and at a narrow/mobile viewport, including keyboard navigation, modal focus containment, Escape-to-close, visible focus styles, loading states, empty states, and error recovery.
 
 Known Phase 12 limitations follow the current API: lists are bounded only by backend responses because no pagination contract exists; dashboard metrics are client-derived snapshots rather than analytics; historical AI sources cannot be displayed because sources are response-only; document status uses bounded polling rather than push events; JWT storage remains browser local storage because Phase 12 preserves the existing token architecture; and AI responses are non-streaming. No delete operations are shown because the backend exposes none.
+
+## Customer Support Intake (Phase 12 extension)
+
+Customers can submit a support request at:
+
+```text
+http://localhost:5173/support/ORGANIZATION_SLUG
+```
+
+The frontend sends exactly `name`, `email`, `subject`, and `message` to:
+
+```http
+POST /api/public/support/:organizationSlug/tickets
+```
+
+This endpoint is intentionally unauthenticated. It does not alter or bypass authentication on `/api/customers`, `/api/tickets`, `/api/tickets/:ticketId/messages`, or any other private route.
+
+### Organization resolution and tenant safety
+
+The URL uses the existing unique, normalized Organization `slug`, which is already used during login and is appropriate as the public workspace identifier. The server validates the slug and resolves the Organization inside the database transaction. Public clients cannot provide `organizationId`, `customerId`, assignment, status, priority, role, user identity, or any additional field; unsupported fields receive a safe `400` response.
+
+Email is normalized to lowercase and customer resolution uses the existing compound uniqueness rule `(organizationId, email)`. A matching customer in the resolved tenant is reused. The same email in a different tenant is unrelated and cannot be reused or exposed.
+
+### Atomic customer, ticket, and message creation
+
+One Prisma transaction performs the complete intake operation:
+
+```text
+validated organization slug
+  → resolve Organization server-side
+  → upsert Customer by organizationId + normalized email
+  → create OPEN / MEDIUM / unassigned Ticket
+  → create CUSTOMER Message linked to that Customer and Ticket
+  → return a safe display reference
+```
+
+The submitted message is used as the ticket description for compatibility with the existing ticket UI and is also stored as the first real conversation message. That message has `senderType=CUSTOMER`, its tenant-scoped `customerId`, and no staff `userId`. Existing staff replies continue to use `senderType=SUPPORT_AGENT`. The schema already supports these relationships, so this extension requires no Prisma schema change or migration.
+
+If customer, ticket, or message creation fails, the transaction commits none of them. The public response contains only the ticket reference, subject, status, and priority; it does not expose tenant IDs, customer IDs, assignment data, authentication information, or internal metadata. The numeric ticket ID is used only as a display reference because no unauthenticated ticket lookup endpoint exists.
+
+### Public form and agent workflow
+
+The public page has no internal sidebar or staff navigation. It provides controlled, labelled Name, Email, Subject, and “How can we help?” fields, client-side validation, server-authoritative validation, a 10,000-character message limit, single-flight submission, abort cleanup, inline errors, and a confirmation containing the ticket reference. It remains independent of staff authentication, including when a staff user is already signed in.
+
+The created ticket is returned by the existing authenticated ticket list. Opening it through `/app/tickets/:ticketId` loads the initial CUSTOMER message through the existing message API, and an authorized staff user replies through the unchanged support-agent message flow.
+
+### Security and abuse-protection limitation
+
+The endpoint accepts untrusted internet input and strictly bounds every field. Organization identity comes only from the resolved slug, and all writes carry the resolved database tenant ID. Raw database/provider errors are never returned. No Gemini call or automatic response occurs; AI remains an internal staff tool.
+
+This phase intentionally does not add Redis or distributed rate limiting. Before public production exposure, deploy edge/API abuse controls such as request throttling, bot protection, and monitoring. The current endpoint is suitable for local verification and architecture integration, not unrestricted internet exposure without those controls.
+
+### Manual customer-to-agent verification
+
+1. Start MySQL, then run `cd server && npx prisma migrate status`.
+2. Start the API with `cd server && npm run dev`.
+3. Start the frontend with `cd client && npm run dev`.
+4. Open `http://localhost:5173/support/YOUR_ORGANIZATION_SLUG`.
+5. Submit Rahul Sharma, `rahul@example.com`, subject `Refund not received`, and message `I returned my order 10 days ago but still haven't received my refund.`
+6. Record the successful ticket reference.
+7. Sign in as an authorized staff user, open Tickets, and find the new ticket.
+8. Open it and verify Rahul's message appears as a CUSTOMER message, then send a staff reply and refresh to confirm persistence.
+9. Submit another public request with `rahul@example.com` and confirm MySQL contains one Customer for that organization/email but two Tickets.
 
 ## 3. Configure the frontend
 

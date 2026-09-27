@@ -80,6 +80,45 @@ export async function apiRequest(path, options = {}) {
   return data;
 }
 
+export async function apiBlobRequest(path, options = {}) {
+  const { headers = {}, auth = true, signal, ...requestOptions } = options;
+  const token = auth ? getToken() : null;
+  let response;
+  try {
+    response = await fetch(`${API_ROOT}${path}`, {
+      ...requestOptions,
+      signal,
+      headers: {
+        Accept: "application/pdf, text/plain",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...headers,
+      },
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+    throw new ApiError("Unable to connect to ResolveAI. Check your network and try again.");
+  }
+
+  if (!response.ok) {
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      // Binary endpoints still use JSON for API errors when possible.
+    }
+    if (response.status === 401 && auth) {
+      window.dispatchEvent(new CustomEvent("resolveai:unauthorized"));
+    }
+    throw new ApiError(data?.message || fallbackMessage(response.status), {
+      status: response.status,
+      kind: errorKinds[response.status] || (response.status >= 500 ? "server" : "request"),
+      data,
+    });
+  }
+
+  return response.blob();
+}
+
 export function queryString(params = {}) {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {

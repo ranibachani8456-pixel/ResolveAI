@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../../hooks/useAuth.js";
 import { useToast } from "../../hooks/useToast.js";
 import Button from "../../components/common/Button.jsx";
+import Icon from "../../components/common/Icon.jsx";
 import { Field, Input } from "../../components/common/FormControls.jsx";
 import AuthLayout from "./AuthLayout.jsx";
 
@@ -10,6 +11,7 @@ export default function LoginPage() {
   const [form, setForm] = useState({ organizationSlug: "", email: "", password: "" });
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const activeRequest = useRef(null);
 
   useEffect(() => () => activeRequest.current?.abort(), []);
@@ -55,7 +57,12 @@ export default function LoginPage() {
           <Input id="email" name="email" type="email" value={form.email} onChange={update} autoComplete="email" placeholder="you@company.com" required />
         </Field>
         <Field label="Password" htmlFor="password">
-          <Input id="password" name="password" type="password" value={form.password} onChange={update} autoComplete="current-password" required />
+          <div className="password-input">
+            <Input id="password" name="password" type={passwordVisible ? "text" : "password"} value={form.password} onChange={update} autoComplete="current-password" required />
+            <button type="button" className="password-input__toggle" aria-label={passwordVisible ? "Hide password" : "Show password"} aria-pressed={passwordVisible} onMouseDown={(event) => event.preventDefault()} onClick={() => setPasswordVisible((visible) => !visible)}>
+              <Icon name={passwordVisible ? "eyeOff" : "eye"} size={18} />
+            </button>
+          </div>
         </Field>
         <Button type="submit" loading={submitting} className="button--full">Sign in</Button>
       </form>

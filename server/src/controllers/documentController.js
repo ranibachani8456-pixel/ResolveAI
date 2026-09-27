@@ -1,4 +1,10 @@
-import { DocumentServiceError, getDocument, listDocuments, uploadDocument } from "../services/documentService.js";
+import {
+  DocumentServiceError,
+  getDocument,
+  getDocumentContent,
+  listDocuments,
+  uploadDocument,
+} from "../services/documentService.js";
 
 function handleDocumentError(error, response) {
   if (error instanceof DocumentServiceError) {
@@ -34,6 +40,31 @@ export async function getDocumentById(request, response) {
   try {
     const document = await getDocument(request.user.organizationId, request.params.documentId);
     return response.status(200).json({ success: true, data: { document } });
+  } catch (error) {
+    return handleDocumentError(error, response);
+  }
+}
+
+export async function previewDocument(request, response) {
+  try {
+    const content = await getDocumentContent(
+      request.user.organizationId,
+      request.params.documentId,
+      request.app?.locals?.documentPreviewStorage,
+    );
+    const fallbackName = content.fileName
+      .replace(/[^\x20-\x7e]/g, "_")
+      .replace(/["\\]/g, "_");
+    const encodedName = encodeURIComponent(content.fileName)
+      .replace(/['()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    response.set({
+      "Content-Type": content.mimeType,
+      "Content-Length": String(content.buffer.length),
+      "Content-Disposition": `inline; filename="${fallbackName}"; filename*=UTF-8''${encodedName}`,
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    return response.status(200).send(content.buffer);
   } catch (error) {
     return handleDocumentError(error, response);
   }

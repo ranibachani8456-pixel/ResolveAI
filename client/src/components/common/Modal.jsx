@@ -1,9 +1,15 @@
 import { useEffect, useRef } from "react";
 import Icon from "./Icon.jsx";
 
-export default function Modal({ open, title, description, onClose, children, footer }) {
+export default function Modal({ open, title, description, onClose, children, footer, className = "" }) {
   const closeButtonRef = useRef(null);
   const modalRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+
+  // Keep the latest callback without restarting focus management on each parent render.
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -11,7 +17,7 @@ export default function Modal({ open, title, description, onClose, children, foo
     closeButtonRef.current?.focus();
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
 
@@ -38,12 +44,12 @@ export default function Modal({ open, title, description, onClose, children, foo
       document.body.classList.remove("modal-open");
       previous?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section ref={modalRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <section ref={modalRef} className={`modal ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby="modal-title">
         <header className="modal__header">
           <div>
             <h2 id="modal-title">{title}</h2>

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import app from "../src/app.js";
 import prisma from "../src/config/prisma.js";
 import s3Client from "../src/config/s3.js";
@@ -15,7 +15,7 @@ import { processDocumentJob } from "../src/services/documentProcessingService.js
 import { RagServiceError } from "../src/services/ragService.js";
 
 // Opt-in: temporary fixtures use real MySQL, but every write is rolled back.
-test("Phase 0–11 API regression with rollback-only MySQL fixtures and mocked external services", {
+test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked external services", {
   skip: process.env.RUN_DB_TESTS !== "1", timeout: 90_000,
 }, async () => {
   const models = ["organization", "user", "customer", "ticket", "message", "document", "aIConversation", "aIMessage"];
@@ -101,7 +101,13 @@ test("Phase 0–11 API regression with rollback-only MySQL fixtures and mocked e
         };
         const s3Commands = [];
         const sqsCommands = [];
-        s3Client.send = async (command) => { s3Commands.push(command); return {}; };
+        s3Client.send = async (command) => {
+          s3Commands.push(command);
+          if (command instanceof GetObjectCommand) {
+            return { ContentLength: 25, Body: Buffer.from("Private preview document") };
+          }
+          return {};
+        };
         sqsClient.send = async (command) => { sqsCommands.push(command); return { MessageId: "mock-message" }; };
         httpServer = app.listen(0, "127.0.0.1");
         await once(httpServer, "listening");
@@ -136,6 +142,52 @@ test("Phase 0–11 API regression with rollback-only MySQL fixtures and mocked e
         const path = `/tickets/${ticket.id}/messages`;
         await request("/health", 200);
         await request("/db-health", 200);
+        const publicCustomerCount = await transaction.customer.count({
+          where: { organizationId: org.id, email: customer.email },
+        });
+        const publicSubmission = await request(
+          `/public/support/${org.slug}/tickets`,
+          201,
+          undefined,
+          "POST",
+          {
+            name: "Public customer name",
+            email: customer.email,
+            subject: "Public support request",
+            message: "This message must appear as the first customer-authored ticket message.",
+          },
+        );
+        assert.equal(
+          await transaction.customer.count({ where: { organizationId: org.id, email: customer.email } }),
+          publicCustomerCount,
+          "public intake must reuse a same-tenant customer",
+        );
+        const publicTicketId = Number(publicSubmission.data.ticket.reference);
+        const publicTicket = await transaction.ticket.findFirst({ where: { id: publicTicketId } });
+        assert.equal(publicTicket.organizationId, org.id);
+        assert.equal(publicTicket.customerId, customer.id);
+        assert.equal(publicTicket.status, "OPEN");
+        assert.equal(publicTicket.priority, "MEDIUM");
+        assert.equal(publicTicket.assignedToId, null);
+        const publicMessages = await transaction.message.findMany({
+          where: { organizationId: org.id, ticketId: publicTicketId },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        });
+        assert.equal(publicMessages.length, 1);
+        assert.equal(publicMessages[0].senderType, "CUSTOMER");
+        assert.equal(publicMessages[0].customerId, customer.id);
+        assert.equal(publicMessages[0].userId, null);
+        await request(`/tickets/${publicTicketId}`, 200, tokens.OWNER);
+        await request(`/tickets/${publicTicketId}/messages`, 200, tokens.OWNER);
+        await request(`/public/support/${org.slug}/tickets`, 400, undefined, "POST", {
+          name: "Public customer", email: "customer-two@phase6.invalid",
+          subject: "Forbidden authority", message: "Reject the privileged field.",
+          organizationId: otherOrg.id,
+        });
+        await request(`/public/support/missing-${suffix}/tickets`, 404, undefined, "POST", {
+          name: "Public customer", email: "unknown@phase6.invalid",
+          subject: "Missing organization", message: "This must not create anything.",
+        });
         const loggedIn = await request("/auth/login", 200, undefined, "POST", { organizationSlug: org.slug, email: members.OWNER.email, password });
         await request("/auth/me", 200, loggedIn.data.token);
         await request("/auth/login", 401, undefined, "POST", { organizationSlug: org.slug, email: members.OWNER.email, password: "wrong" });
@@ -164,6 +216,13 @@ test("Phase 0–11 API regression with rollback-only MySQL fixtures and mocked e
           await request(path, 200, tokens[role]);
           await request("/documents", 200, tokens[role]);
           await request(`/documents/${document.id}`, 200, tokens[role]);
+          const previewResponse = await fetch(`${base}/documents/${document.id}/content`, {
+            headers: { Authorization: `Bearer ${tokens[role]}` },
+          });
+          assert.equal(previewResponse.status, 200);
+          assert.equal(previewResponse.headers.get("content-type"), "text/plain");
+          assert.equal(previewResponse.headers.get("cache-control"), "private, no-store");
+          assert.equal(await previewResponse.text(), "Private preview document");
           const aiResponse = await request("/ai/ask", 200, tokens[role], "POST", {
             question: "What is the refund window?",
           });
@@ -274,10 +333,11 @@ test("Phase 0–11 API regression with rollback-only MySQL fixtures and mocked e
         await upload(400, tokens.OWNER, { name: "fake.pdf", blob: new Blob(["not pdf"], { type: "application/pdf" }) });
         await upload(413, tokens.OWNER, { name: "large.txt", blob: new Blob([Buffer.alloc(10 * 1024 * 1024 + 1, 65)], { type: "text/plain" }) });
         await request(`/documents/${otherDocument.id}`, 404, tokens.OWNER);
+        await request(`/documents/${otherDocument.id}/content`, 404, tokens.OWNER);
         await request("/documents/2147483647", 404, tokens.OWNER);
         await request("/documents/invalid", 400, tokens.OWNER);
         assert.ok(s3Commands.length >= 2);
-        for (const command of s3Commands) {
+        for (const command of s3Commands.filter((item) => !(item instanceof GetObjectCommand))) {
           assert.match(command.input.Key, new RegExp(`^organizations/${org.id}/documents/[0-9a-f-]+-notes\\.txt$`));
           assert.equal(command.input.ACL, undefined);
         }

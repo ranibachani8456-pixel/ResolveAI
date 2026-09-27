@@ -15,6 +15,8 @@ const paths = {
   refresh: <><path d="M20 6v5h-5"/><path d="M4 18v-5h5"/><path d="M18 9a7 7 0 0 0-12-2L4 11M6 15a7 7 0 0 0 12 2l2-4"/></>,
   send: <><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></>,
   chevronDown: <path d="m6 9 6 6 6-6"/>,
+  eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></>,
+  eyeOff: <><path d="m3 3 18 18"/><path d="M10.6 6.2A11.5 11.5 0 0 1 12 6c6.5 0 10 6 10 6a17 17 0 0 1-3 3.8M6.5 6.5C3.6 8.3 2 12 2 12s3.5 6 10 6c1.3 0 2.5-.2 3.5-.6"/><path d="M10.2 10.2a2.5 2.5 0 0 0 3.6 3.6"/></>,
 };
 
 export default function Icon({ name, size = 18, className = "" }) {

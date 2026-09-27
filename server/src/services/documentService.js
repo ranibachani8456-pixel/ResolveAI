@@ -7,6 +7,8 @@ import s3Client from "../config/s3.js";
 import { env } from "../config/env.js";
 import { MAX_DOCUMENT_SIZE_BYTES } from "../utils/documentLimits.js";
 import { enqueueDocumentProcessing } from "./documentQueueService.js";
+import { downloadDocument } from "./documentStorageService.js";
+import { PermanentDocumentError } from "./documentProcessingErrors.js";
 
 const ALLOWED_MIME_TYPES = new Set(["application/pdf", "text/plain"]);
 
@@ -185,4 +187,30 @@ export async function getDocument(organizationId, rawDocumentId) {
   });
   if (!document) throw new DocumentServiceError(404, "Document not found");
   return document;
+}
+
+export async function getDocumentContent(organizationId, rawDocumentId, storageOverrides) {
+  const documentId = parseDocumentId(rawDocumentId);
+  // storageKey is selected only for the server-side S3 request and is never serialized.
+  const document = await prisma.document.findFirst({
+    where: { id: documentId, organizationId },
+    select: { id: true, fileName: true, mimeType: true, storageKey: true },
+  });
+  if (!document) throw new DocumentServiceError(404, "Document not found");
+  if (!ALLOWED_MIME_TYPES.has(document.mimeType)) {
+    throw new DocumentServiceError(409, "Document preview is unavailable");
+  }
+
+  try {
+    const buffer = await downloadDocument(document, storageOverrides);
+    return { fileName: document.fileName, mimeType: document.mimeType, buffer };
+  } catch (error) {
+    console.error(
+      `Document preview retrieval failed: documentId=${document.id} organizationId=${organizationId} error=${error?.name || "Error"}`,
+    );
+    if (error instanceof PermanentDocumentError) {
+      throw new DocumentServiceError(404, "Document content is unavailable");
+    }
+    throw new DocumentServiceError(502, "Document preview is temporarily unavailable");
+  }
 }

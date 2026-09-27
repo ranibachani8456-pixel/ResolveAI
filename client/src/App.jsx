@@ -16,11 +16,14 @@ const KnowledgePage = lazy(() => import("./features/knowledge/KnowledgePage.jsx"
 const AIAssistantPage = lazy(() => import("./features/ai/AIAssistantPage.jsx"));
 const TeamPage = lazy(() => import("./features/organization/TeamPage.jsx"));
 const NotFoundPage = lazy(() => import("./features/not-found/NotFoundPage.jsx"));
+const SupportPage = lazy(() => import("./features/support/SupportPage.jsx"));
 
 function App() {
   return (
     <Suspense fallback={<PageSkeleton fullPage />}>
       <Routes>
+        <Route path="/support/:organizationSlug" element={<SupportPage />} />
+
         <Route element={<PublicRoute />}>
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />

@@ -8,6 +8,7 @@ import ticketRoutes from "./ticketRoutes.js";
 import messageRoutes from "./messageRoutes.js";
 import documentRoutes from "./documentRoutes.js";
 import aiRoutes from "./aiRoutes.js";
+import publicSupportRoutes from "./publicSupportRoutes.js";
 
 const router = Router();
 
@@ -15,6 +16,7 @@ const router = Router();
 router.use("/health", healthRoutes);
 router.use("/db-health", databaseHealthRoutes);
 router.use("/auth", authRoutes);
+router.use("/public", publicSupportRoutes);
 router.use("/organization", organizationRoutes);
 router.use("/customers", customerRoutes);
 router.use("/documents", documentRoutes);

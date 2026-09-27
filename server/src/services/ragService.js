@@ -136,8 +136,20 @@ export async function answerKnowledgeQuestion(identity, input, dependencies = {}
       },
     );
   } catch (error) {
-    throw new RagServiceError(502, "Unable to generate a grounded answer", "generation", error);
-  }
+  console.error("Gemini generation diagnostic:", {
+    name: error?.name,
+    status: error?.status,
+    code: error?.code,
+    message: error?.message,
+  });
+
+  throw new RagServiceError(
+    502,
+    "Unable to generate a grounded answer",
+    "generation",
+    error,
+  );
+}
 
   return { answer, sources: sourcesFrom(bounded.items) };
 }

@@ -9,6 +9,7 @@ import PageHeader from "../../components/common/PageHeader.jsx";
 import Button from "../../components/common/Button.jsx";
 import Avatar from "../../components/common/Avatar.jsx";
 import Badge from "../../components/common/Badge.jsx";
+import Icon from "../../components/common/Icon.jsx";
 import Modal from "../../components/common/Modal.jsx";
 import { Field, Input, Select } from "../../components/common/FormControls.jsx";
 import PageSkeleton from "../../components/feedback/PageSkeleton.jsx";
@@ -34,6 +35,7 @@ export default function TeamPage() {
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [updating, setUpdating] = useState(null);
+  const [passwordVisible, setPasswordVisible] = useState(false);
 
   const load = useCallback(() => {
     const controller = new AbortController();
@@ -43,6 +45,11 @@ export default function TeamPage() {
     return controller;
   }, []);
   useEffect(() => { if (!canManageTeam(user.role)) return undefined; const controller = load(); return () => controller.abort(); }, [load, user.role]);
+
+  const closeCreate = useCallback(() => {
+    setCreateOpen(false);
+    setPasswordVisible(false);
+  }, []);
 
   if (!canManageTeam(user.role)) return <Navigate to="/app/dashboard" replace />;
 
@@ -77,7 +84,7 @@ export default function TeamPage() {
       <PageHeader eyebrow="Organization settings" title="Team" description={`Manage access to ${activeOrganization?.name || "your workspace"}. Backend role checks remain authoritative.`} actions={<Button icon="plus" onClick={() => setCreateOpen(true)}>Add member</Button>} />
       <section className="organization-strip"><div><span>Organization</span><strong>{activeOrganization?.name}</strong></div><div><span>Workspace slug</span><strong>{activeOrganization?.slug}</strong></div><div><span>Members</span><strong>{state.users.length}</strong></div></section>
       <section className="data-list" aria-label="Organization members"><div className="data-list__header team-row"><span>Member</span><span>Role</span><span>Joined</span><span>Status</span></div>{state.users.map((member) => <MemberRow key={member.id} member={member} canEditRole={user.role === ROLES.OWNER} updating={updating === member.id} onRoleChange={updateRole} />)}</section>
-      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Add team member" description="Owners and admins may create admins, support agents, or viewers." footer={<><Button variant="secondary" onClick={() => setCreateOpen(false)}>Cancel</Button><Button type="submit" form="create-member-form" loading={submitting}>Add member</Button></>}><form id="create-member-form" className="form-stack" onSubmit={createMember}>{formError ? <div className="inline-alert inline-alert--error" role="alert">{formError}</div> : null}<Field label="Name" htmlFor="member-name"><Input id="member-name" value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} required /></Field><Field label="Email" htmlFor="member-email"><Input id="member-email" type="email" value={form.email} onChange={(event) => setForm((current) => ({ ...current, email: event.target.value }))} required /></Field><Field label="Temporary password" htmlFor="member-password" hint="At least 8 characters; share it securely."><Input id="member-password" type="password" minLength="8" value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} required /></Field><Field label="Role" htmlFor="member-role"><Select id="member-role" value={form.role} onChange={(event) => setForm((current) => ({ ...current, role: event.target.value }))}><option value="ADMIN">Admin</option><option value="SUPPORT_AGENT">Support agent</option><option value="VIEWER">Viewer</option></Select></Field></form></Modal>
+      <Modal open={createOpen} onClose={closeCreate} title="Add team member" description="Owners and admins may create admins, support agents, or viewers." footer={<><Button variant="secondary" onClick={closeCreate}>Cancel</Button><Button type="submit" form="create-member-form" loading={submitting}>Add member</Button></>}><form id="create-member-form" className="form-stack" onSubmit={createMember}>{formError ? <div className="inline-alert inline-alert--error" role="alert">{formError}</div> : null}<Field label="Name" htmlFor="member-name"><Input id="member-name" value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} required /></Field><Field label="Email" htmlFor="member-email"><Input id="member-email" type="email" value={form.email} onChange={(event) => setForm((current) => ({ ...current, email: event.target.value }))} required /></Field><Field label="Temporary password" htmlFor="member-password" hint="At least 8 characters; share it securely."><div className="password-input"><Input id="member-password" type={passwordVisible ? "text" : "password"} minLength="8" value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} required /><button type="button" className="password-input__toggle" aria-label={passwordVisible ? "Hide password" : "Show password"} aria-pressed={passwordVisible} onMouseDown={(event) => event.preventDefault()} onClick={() => setPasswordVisible((visible) => !visible)}><Icon name={passwordVisible ? "eyeOff" : "eye"} size={18} /></button></div></Field><Field label="Role" htmlFor="member-role"><Select id="member-role" value={form.role} onChange={(event) => setForm((current) => ({ ...current, role: event.target.value }))}><option value="ADMIN">Admin</option><option value="SUPPORT_AGENT">Support agent</option><option value="VIEWER">Viewer</option></Select></Field></form></Modal>
     </div>
   );
 }

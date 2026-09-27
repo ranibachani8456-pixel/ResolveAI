@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import prisma from "../src/config/prisma.js";
 import { env } from "../src/config/env.js";
 import { MAX_DOCUMENT_SIZE_BYTES } from "../src/utils/documentLimits.js";
-import { getDocument, listDocuments, uploadDocument } from "../src/services/documentService.js";
+import {
+  getDocument,
+  getDocumentContent,
+  listDocuments,
+  uploadDocument,
+} from "../src/services/documentService.js";
 
 const textFile = (overrides = {}) => ({
   originalname: "notes.txt",
@@ -61,6 +66,42 @@ test("document service validation, tenancy, S3 coordination and safe metadata", 
         return null;
       };
       await assert.rejects(getDocument(7, "2"), (error) => error.statusCode === 404);
+    });
+
+    await context.test("preview retrieval is tenant scoped and keeps private S3 keys server-side", async () => {
+      prisma.document.findFirst = async (query) => {
+        assert.deepEqual(query.where, { id: 2, organizationId: 7 });
+        assert.equal(query.select.storageKey, true);
+        return {
+          id: 2,
+          fileName: "policy.txt",
+          mimeType: "text/plain",
+          storageKey: "organizations/7/documents/private-policy.txt",
+        };
+      };
+      const client = { send: async (command) => {
+        assert.ok(command instanceof GetObjectCommand);
+        assert.deepEqual(command.input, {
+          Bucket: "private-bucket",
+          Key: "organizations/7/documents/private-policy.txt",
+        });
+        return { ContentLength: 14, Body: Buffer.from("Private policy") };
+      } };
+      const result = await getDocumentContent(7, "2", {
+        bucket: "private-bucket",
+        region: "us-east-1",
+        client,
+      });
+      assert.equal(result.fileName, "policy.txt");
+      assert.equal(result.mimeType, "text/plain");
+      assert.equal(result.buffer.toString(), "Private policy");
+      assert.equal(result.storageKey, undefined);
+
+      prisma.document.findFirst = async () => null;
+      await assert.rejects(
+        getDocumentContent(7, "2", { bucket: "private-bucket", region: "us-east-1", client }),
+        (error) => error.statusCode === 404,
+      );
     });
 
     await context.test("server generates a tenant key and stores only trusted metadata", async () => {
