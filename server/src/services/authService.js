@@ -3,17 +3,25 @@ import { Prisma } from "@prisma/client";
 import prisma from "../config/prisma.js";
 import { env } from "../config/env.js";
 import { assertJwtConfiguration, signJwt } from "../utils/jwt.js";
+import {
+  GoogleCredentialError,
+  GoogleIdentityConfigurationError,
+  verifyGoogleCredential,
+} from "./googleIdentityService.js";
 
 const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_BYTES = 72;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// Comparing against a real-cost hash makes missing-account login work less distinguishable.
+const DUMMY_PASSWORD_HASH = "$2b$12$H6dNoYsI5NEgKlYhrymbFuOF0fiejcu7qlXGuqaJqHi7k.v315XFO";
 
 export class AuthServiceError extends Error {
-  constructor(statusCode, message) {
+  constructor(statusCode, message, code) {
     super(message);
     this.name = "AuthServiceError";
     this.statusCode = statusCode;
+    this.code = code;
   }
 }
 
@@ -30,6 +38,15 @@ function requireString(value, fieldName) {
   }
 
   return value.trim();
+}
+
+function assertExactFields(input, allowedFields) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new AuthServiceError(400, "Request body must be an object");
+  }
+  if (Object.keys(input).some((field) => !allowedFields.has(field))) {
+    throw new AuthServiceError(400, "Request contains unsupported fields");
+  }
 }
 
 function normalizeEmail(value) {
@@ -77,6 +94,9 @@ function validateBcryptConfiguration() {
 }
 
 function validateRegistrationInput(input) {
+  assertExactFields(input, new Set([
+    "organizationName", "organizationSlug", "name", "email", "password",
+  ]));
   const organizationName = requireString(input?.organizationName, "organizationName");
   const name = requireString(input?.name, "name");
 
@@ -94,6 +114,7 @@ function validateRegistrationInput(input) {
 }
 
 function validateLoginInput(input) {
+  assertExactFields(input, new Set(["organizationSlug", "email", "password"]));
   if (typeof input?.password !== "string" || !input.password) {
     throw new AuthServiceError(400, "password is required");
   }
@@ -103,6 +124,15 @@ function validateLoginInput(input) {
     email: normalizeEmail(input?.email),
     password: input.password,
   };
+}
+
+function validateGoogleLoginInput(input) {
+  assertExactFields(input, new Set(["credential"]));
+  const credential = requireString(input.credential, "credential");
+  if (credential.length > 16_384) {
+    throw new AuthServiceError(400, "credential is invalid");
+  }
+  return credential;
 }
 
 function assertAuthenticationConfiguration() {
@@ -116,6 +146,39 @@ function createIdentity(user) {
     organizationId: user.organizationId,
     role: user.role,
   };
+}
+
+const googleUserSelect = {
+  id: true,
+  organizationId: true,
+  name: true,
+  email: true,
+  role: true,
+  organization: {
+    select: { id: true, name: true, slug: true },
+  },
+};
+
+function createSession(user) {
+  return {
+    token: signJwt(createIdentity(user)),
+    organization: user.organization,
+    user: {
+      id: user.id,
+      organizationId: user.organizationId,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+    },
+  };
+}
+
+function unlinkedGoogleAccount() {
+  return new AuthServiceError(
+    403,
+    "No ResolveAI account is linked to this Google account",
+    "GOOGLE_ACCOUNT_NOT_LINKED",
+  );
 }
 
 export async function register(input) {
@@ -189,32 +252,31 @@ export async function login(input) {
     select: { id: true, name: true, slug: true },
   });
 
-  if (!organization) {
-    throw new AuthServiceError(401, "Invalid organization, email, or password");
-  }
-
-  const user = await prisma.user.findUnique({
-    where: {
-      organizationId_email: {
-        organizationId: organization.id,
-        email: data.email,
+  const user = organization
+    ? await prisma.user.findUnique({
+      where: {
+        organizationId_email: {
+          organizationId: organization.id,
+          email: data.email,
+        },
       },
-    },
-    select: {
-      id: true,
-      organizationId: true,
-      name: true,
-      email: true,
-      passwordHash: true,
-      role: true,
-    },
-  });
+      select: {
+        id: true,
+        organizationId: true,
+        name: true,
+        email: true,
+        passwordHash: true,
+        role: true,
+      },
+    })
+    : null;
 
-  const passwordMatches = user
-    ? await bcrypt.compare(data.password, user.passwordHash)
-    : false;
+  const passwordMatches = await bcrypt.compare(
+    data.password,
+    user?.passwordHash || DUMMY_PASSWORD_HASH,
+  );
 
-  if (!user || !passwordMatches) {
+  if (!organization || !user || !passwordMatches) {
     throw new AuthServiceError(401, "Invalid organization, email, or password");
   }
 
@@ -231,6 +293,85 @@ export async function login(input) {
     organization,
     user: safeUser,
   };
+}
+
+export async function loginWithGoogle(input, dependencies = {}) {
+  const credential = validateGoogleLoginInput(input);
+  assertJwtConfiguration();
+
+  let verifiedIdentity;
+  try {
+    verifiedIdentity = await (dependencies.verifyGoogleCredential ?? verifyGoogleCredential)(credential);
+  } catch (error) {
+    if (error instanceof GoogleIdentityConfigurationError) throw error;
+    if (error instanceof GoogleCredentialError) {
+      throw new AuthServiceError(401, "Google authentication failed", "GOOGLE_CREDENTIAL_INVALID");
+    }
+    // Injected/provider boundaries must never leak their raw failure details.
+    throw new AuthServiceError(401, "Google authentication failed", "GOOGLE_CREDENTIAL_INVALID");
+  }
+
+  let email;
+  try {
+    email = normalizeEmail(verifiedIdentity.email);
+  } catch {
+    throw new AuthServiceError(401, "Google authentication failed", "GOOGLE_CREDENTIAL_INVALID");
+  }
+  const providerSubject = verifiedIdentity.providerSubject;
+  if (typeof providerSubject !== "string" || !providerSubject || providerSubject.length > 191) {
+    throw new AuthServiceError(401, "Google authentication failed", "GOOGLE_CREDENTIAL_INVALID");
+  }
+
+  try {
+    return await prisma.$transaction(async (transaction) => {
+      const linkedIdentity = await transaction.authIdentity.findUnique({
+        where: {
+          provider_providerSubject: { provider: "GOOGLE", providerSubject },
+        },
+        select: { user: { select: googleUserSelect } },
+      });
+      if (linkedIdentity) return createSession(linkedIdentity.user);
+
+      // Email is used only for a guarded first-time link. The durable identity is Google sub.
+      const candidates = await transaction.user.findMany({
+        where: { email },
+        select: { id: true },
+        take: 2,
+      });
+      if (candidates.length !== 1) throw unlinkedGoogleAccount();
+
+      const existingGoogleIdentity = await transaction.authIdentity.findUnique({
+        where: { userId_provider: { userId: candidates[0].id, provider: "GOOGLE" } },
+        select: { id: true },
+      });
+      if (existingGoogleIdentity) throw unlinkedGoogleAccount();
+
+      await transaction.authIdentity.create({
+        data: {
+          userId: candidates[0].id,
+          provider: "GOOGLE",
+          providerSubject,
+        },
+        select: { id: true },
+      });
+      const user = await transaction.user.findUnique({
+        where: { id: candidates[0].id },
+        select: googleUserSelect,
+      });
+      if (!user) throw unlinkedGoogleAccount();
+      return createSession(user);
+    });
+  } catch (error) {
+    if (error instanceof AuthServiceError) throw error;
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      throw new AuthServiceError(
+        409,
+        "Google account could not be linked safely. Please try again or contact your administrator.",
+        "GOOGLE_ACCOUNT_LINK_CONFLICT",
+      );
+    }
+    throw error;
+  }
 }
 
 export async function getCurrentUser({ userId, organizationId }) {

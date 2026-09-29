@@ -6,7 +6,7 @@
   "main": "src/server.js",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/message.test.js tests/publicSupport.test.js tests/document.test.js tests/queueWorker.test.js tests/ingestionServices.test.js tests/documentProcessing.test.js tests/ai.test.js tests/aiConversation.test.js",
+    "test": "node --test tests/auth.test.js tests/message.test.js tests/publicSupport.test.js tests/document.test.js tests/queueWorker.test.js tests/ingestionServices.test.js tests/documentProcessing.test.js tests/ai.test.js tests/aiConversation.test.js",
     "test:integration": "RUN_DB_TESTS=1 node --test tests/phase6.integration.test.js",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
@@ -27,6 +27,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
+    "google-auth-library": "^11.1.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.0",

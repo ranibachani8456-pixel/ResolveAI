@@ -1,6 +1,6 @@
 # ResolveAI
 
-ResolveAI is an AI-powered customer support platform under active development. Through Phase 12 and its support-intake extension, it includes a public customer-to-agent ticket flow, a production-style React support dashboard backed by the existing Express API, a multi-tenant MySQL schema with Prisma, JWT authentication, role-protected organization management, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
+ResolveAI is an AI-powered customer support platform under active development. Through Phase 13, it includes password and Google authentication, hardened tenant-authoritative RBAC, a public customer-to-agent ticket flow, a production-style React support dashboard backed by the existing Express API, a multi-tenant MySQL schema with Prisma, Customer/Ticket APIs, ticket conversations, private S3 uploads, asynchronous SQS jobs, document ingestion into Qdrant, tenant-safe grounded knowledge-base answers using Gemini, and persistent user-owned AI conversations with bounded multi-turn history.
 
 ## Project structure
 
@@ -14,7 +14,7 @@ Automatic ticket replies, Redis, streaming, reranking, hybrid search, and advanc
 
 ## Planned future stack
 
-The following technologies describe the planned stack. React/Express, the support dashboard, local MySQL/Prisma, JWT authentication, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, grounded RAG answers, and persistent AI conversations are configured through Phase 12:
+The following technologies describe the planned stack. React/Express, the support dashboard, local MySQL/Prisma, password and Google authentication, JWTs, organization-level RBAC, Customer/Ticket/Message APIs, private S3 storage, SQS document jobs, Gemini embeddings, Qdrant indexing, grounded RAG answers, and persistent AI conversations are configured through Phase 13:
 
 - **Frontend:** React.js, JavaScript, and Vite
 - **Backend:** Node.js, Express.js, JavaScript, and REST APIs
@@ -1086,6 +1086,175 @@ This phase intentionally does not add Redis or distributed rate limiting. Before
 8. Open it and verify Rahul's message appears as a CUSTOMER message, then send a staff reply and refresh to confirm persistence.
 9. Submit another public request with `rahul@example.com` and confirm MySQL contains one Customer for that organization/email but two Tickets.
 
+## Google Sign-In and authentication hardening (Phase 13)
+
+Phase 13 adds Google as an identity provider without making Google authoritative for ResolveAI access. Email/password registration and login remain available and unchanged at their existing endpoints.
+
+### Authentication architecture
+
+The two authentication paths converge on the same ResolveAI session:
+
+```text
+Password + organization slug ──→ ResolveAI User ──┐
+                                                  ├─→ ResolveAI JWT ─→ existing AuthContext/RBAC
+Google ID token ─→ verified Google sub ─→ mapping ┘
+```
+
+The browser receives a Google-issued ID token in the `credential` callback from Google Identity Services and sends only that credential to `POST /api/auth/google`. The API verifies its signature, issuer, expiry, and intended audience with Google's official Node.js authentication library. ResolveAI then uses the verified Google `sub` claim to find an `AuthIdentity`, reloads the linked `User` and `Organization` from MySQL, and issues the same application JWT used by password login.
+
+Google proves identity only. It never supplies or controls a ResolveAI user ID, organization, role, or permission. Protected requests continue through the existing Bearer-token middleware, which reloads current organization membership and role from MySQL on every request. `/api/auth/me` also remains database-authoritative.
+
+No Google access token or refresh token is requested or stored. ResolveAI does not request Gmail, Drive, Calendar, Contacts, or other Google API access.
+
+### Identity mapping and account-linking policy
+
+`AuthIdentity` stores `userId`, `provider`, and the stable provider subject. Database uniqueness on `(provider, providerSubject)` prevents one Google account from mapping to multiple users, and uniqueness on `(userId, provider)` prevents one user from acquiring multiple Google mappings. Deleting a user cascades to its identity mapping.
+
+The exact Google policy is:
+
+1. If the verified Google `sub` is already linked, ResolveAI authenticates that linked user. Later Google email/profile changes do not remap the account.
+2. If the `sub` is new, ResolveAI uses the verified, normalized Google email only for a guarded first-time link.
+3. Automatic linking occurs only when exactly one ResolveAI user across all organizations has that email and that user has no other Google identity.
+4. Zero matches, multiple cross-tenant matches, and an existing different Google identity all return the same safe `GOOGLE_ACCOUNT_NOT_LINKED` state. ResolveAI does not reveal match counts or tenant details.
+5. Unknown Google users are not created, assigned to an organization, or granted a role. Google login never creates an organization.
+6. Uniqueness races fail closed with `GOOGLE_ACCOUNT_LINK_CONFLICT`; the API never guesses a mapping.
+
+An OWNER/ADMIN-created team member can therefore keep using their temporary password and start using Google by selecting a Google account whose verified email exactly matches that member and is unambiguous across ResolveAI. The original MySQL organization and role remain unchanged. If the same email exists in more than one tenant, password login continues to work but automatic Google linking is refused; there is intentionally no explicit administrator-approved linking UI in Phase 13.
+
+### Validation and hardening
+
+The Google endpoint accepts exactly one field:
+
+```json
+{ "credential": "GOOGLE_ISSUED_ID_TOKEN" }
+```
+
+Extra fields such as `organizationId`, `userId`, `role`, or `permissions` are rejected before provider verification or database access. Invalid, expired, wrong-audience, and malformed Google credentials share one safe authentication failure. Raw provider errors and credentials are not logged or returned. The normal password response remains generic for unknown organizations, unknown emails, and wrong passwords, and a dummy bcrypt comparison reduces account-existence timing differences.
+
+JWTs remain HS256-signed with a minimum 32-character secret, explicit algorithm verification, and configured expiry. Although the token contains tenant and role claims, authorization does not trust a stale role claim: middleware refreshes the current user, tenant membership, and role from MySQL. Removed users immediately lose access.
+
+Phase 13 deliberately retains the existing Bearer JWT in `localStorage`. Moving to HttpOnly cookies safely would also require a complete CSRF policy, production-aware `SameSite`/`Secure` behavior, credentialed CORS, and coordinated client/server migration. A partial cookie migration would be less safe. The remaining XSS/token-theft risk means production must use a restrictive CSP, careful dependency hygiene, and no unsafe HTML injection; a full session-cookie design remains future work.
+
+### Environment variables
+
+Use the same Web application client ID on both sides:
+
+`server/.env`:
+
+```env
+GOOGLE_CLIENT_ID=1234567890-example.apps.googleusercontent.com
+```
+
+`client/.env`:
+
+```env
+VITE_GOOGLE_CLIENT_ID=1234567890-example.apps.googleusercontent.com
+```
+
+`VITE_GOOGLE_CLIENT_ID` is intentionally browser-public. An OAuth client ID is an identifier, not a secret. This implementation does not use an OAuth client secret, so do not place one in either frontend configuration or source control. Real `.env` files remain ignored; only placeholder `.env.example` files are tracked.
+
+### Exact Google Auth Platform setup
+
+This implementation uses the Google Identity Services JavaScript button in popup mode with a JavaScript callback. It does not use a redirect callback and therefore needs no Authorized redirect URI.
+
+1. Open the [Google Auth Platform / Clients page](https://console.cloud.google.com/auth/clients) and select or create the intended Google Cloud project.
+2. Configure the Auth Platform branding and audience. While the app is in testing, add the Google accounts that should be allowed as test users if Google requires it for the selected audience.
+3. Create a client with application type **Web application**.
+4. Add both local development origins under **Authorized JavaScript origins**:
+   - `http://localhost`
+   - `http://localhost:5173`
+5. Add the real HTTPS frontend origin separately when deploying, for example `https://app.example.com`. Origins contain scheme, hostname, and optional port, but no path.
+6. Leave **Authorized redirect URIs** empty for this flow because the JavaScript popup returns the ID token to the configured callback.
+7. Copy the Web client ID into both environment variables above. Do not copy the client secret into ResolveAI.
+8. Restart both Vite and Express after changing environment variables.
+
+These steps match Google's [GIS setup guide](https://developers.google.com/identity/gsi/web/guides/get-google-api-clientid), [JavaScript button flow](https://developers.google.com/identity/gsi/web/guides/display-button), and [server-side ID-token verification guidance](https://developers.google.com/identity/gsi/web/guides/verify-google-id-token). The local Vite server supplies `Cross-Origin-Opener-Policy: same-origin-allow-popups` for browsers that are not using FedCM, and the page uses Google's recommended local-development referrer policy. If production adds CSP, allow the GIS script, frame, style, and connection origins described in Google's setup guide.
+
+### Migration and startup
+
+The new migration only creates `AuthIdentity`; it does not alter or delete existing users, passwords, organizations, or roles.
+
+```bash
+cd server
+npm install
+npx prisma validate
+npx prisma generate
+npx prisma migrate dev
+npm run dev
+```
+
+In a second terminal:
+
+```bash
+cd client
+npm install
+npm run dev
+```
+
+Do not reset the database. For controlled production deployment, review the migration and apply committed migrations with `npx prisma migrate deploy` through the normal release process.
+
+### Real manual verification
+
+**Test A — password authentication**
+
+1. Leave the existing organization slug, email, and password fields populated and sign in normally.
+2. Confirm the dashboard and role-aware navigation load.
+3. In the browser console, run the following same-origin check without printing the token:
+
+   ```js
+   fetch("/api/auth/me", {
+     headers: { Authorization: `Bearer ${localStorage.getItem("resolveai.session.token")}` },
+   }).then((response) => response.json()).then(console.log)
+   ```
+
+4. Confirm the returned user, organization, and role are correct, then log out.
+
+**Test B — Google authentication**
+
+1. Complete the Google setup and environment configuration above and restart both processes.
+2. Open `http://localhost:5173/login`; the official **Continue with Google** control should appear below the password form.
+3. Select an account whose verified email safely maps under the policy above.
+4. Confirm dashboard access, inspect `/api/auth/me` using the same console command, refresh to verify session restoration, and log out.
+
+**Test C — existing team member**
+
+1. As OWNER/ADMIN, create a member with their real Google email, temporary password, and intended non-owner role.
+2. Ensure that email does not belong to another ResolveAI user in a different tenant.
+3. Log out and use Google with that exact email. Confirm `/api/auth/me` reports the original organization and original role.
+4. Log out and verify the temporary-password path still works.
+
+**Test D — unknown or ambiguous Google user**
+
+1. Select a Google account with no ResolveAI user, or an email represented in multiple tenants.
+2. Confirm the login page shows “No ResolveAI account is linked to this Google account.”
+3. Confirm no organization/user/identity was created and no dashboard access or OWNER privilege was granted.
+
+**Test E — tenant and privilege escalation**
+
+Automated tests submit `organizationId`, `userId`, `role`, and `permissions` alongside a credential and require `400`. For a manual check, use the browser Network panel to copy the `/api/auth/google` request as a development-only request, add one of those fields, and verify it is rejected. Never share or commit the short-lived Google credential shown in developer tools.
+
+### Phase 13 verification and limitations
+
+Run:
+
+```bash
+cd server
+npm test
+npm run prisma:validate
+npm run prisma:generate
+npx prisma migrate status
+npm audit
+
+cd ../client
+npm test
+npm run build
+npm audit
+```
+
+Normal tests inject the Google verification boundary and never contact Google. The rollback-only integration suite remains opt-in with `RUN_DB_TESTS=1 npm run test:integration` and requires local MySQL with the new migration applied.
+
+Known limitations: real Google login cannot be verified until a real Web client ID and allowed Google account are configured; there is no explicit link/unlink or administrator-approval screen; unknown Google users cannot register with Google; logout clears the ResolveAI session but does not revoke the user's Google account consent; JWTs remain in localStorage; and rate limiting/production deployment controls remain outside Phase 13.
+
 ## 3. Configure the frontend
 
 Open a second terminal:
@@ -1112,7 +1281,7 @@ Run these inside `client/`:
 - `npm run dev` starts Vite's development server.
 - `npm run build` creates a production frontend build.
 - `npm run preview` previews the production build locally.
-- `npm test` runs the Phase 12 frontend tests once.
+- `npm test` runs the frontend regression tests once.
 - `npm run test:watch` runs frontend tests in watch mode.
 
 Run these inside `server/`:

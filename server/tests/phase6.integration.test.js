@@ -15,10 +15,10 @@ import { processDocumentJob } from "../src/services/documentProcessingService.js
 import { RagServiceError } from "../src/services/ragService.js";
 
 // Opt-in: temporary fixtures use real MySQL, but every write is rolled back.
-test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked external services", {
+test("Phase 0–13 API regression with rollback-only MySQL fixtures and mocked external services", {
   skip: process.env.RUN_DB_TESTS !== "1", timeout: 90_000,
 }, async () => {
-  const models = ["organization", "user", "customer", "ticket", "message", "document", "aIConversation", "aIMessage"];
+  const models = ["organization", "user", "authIdentity", "customer", "ticket", "message", "document", "aIConversation", "aIMessage"];
   const counts = () => Promise.all(models.map((name) => prisma[name].count()));
   const before = await counts();
   const rollback = new Error("Intentional fixture rollback");
@@ -30,6 +30,7 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
   const originalQueueUrl = env.awsSqsDocumentQueueUrl;
   const originalRagDependencies = app.locals.ragDependencies;
   const originalAIConversationDependencies = app.locals.aiConversationDependencies;
+  const originalGoogleAuthDependencies = app.locals.googleAuthDependencies;
   const saved = [];
   let httpServer;
   try {
@@ -48,6 +49,11 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
         }
         const otherUser = await transaction.user.create({ data: {
           organizationId: otherOrg.id, name: "Other owner", email: "other@phase6.invalid", passwordHash, role: "OWNER",
+        } });
+        await transaction.authIdentity.create({ data: {
+          userId: members.OWNER.id,
+          provider: "GOOGLE",
+          providerSubject: `google-owner-${suffix}`,
         } });
         const customer = await transaction.customer.create({ data: { organizationId: org.id, name: "Test customer", email: "customer@phase6.invalid" } });
         const otherCustomer = await transaction.customer.create({ data: { organizationId: otherOrg.id, name: "Other customer", email: "customer@phase6.invalid" } });
@@ -97,6 +103,20 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
           generateGroundedAnswer: async (question, context) => {
             aiCalls.push({ stage: "generation", question, hasContext: context.includes("30 days") });
             return "The refund window is 30 days.";
+          },
+        };
+        app.locals.googleAuthDependencies = {
+          verifyGoogleCredential: async (credential) => {
+            if (credential === "valid-owner-google-credential") {
+              return {
+                providerSubject: `google-owner-${suffix}`,
+                email: members.OWNER.email,
+              };
+            }
+            if (credential === "unknown-google-credential") {
+              return { providerSubject: `unknown-${suffix}`, email: "unknown-google@phase6.invalid" };
+            }
+            throw new Error("synthetic provider verification failure");
           },
         };
         const s3Commands = [];
@@ -190,6 +210,26 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
         });
         const loggedIn = await request("/auth/login", 200, undefined, "POST", { organizationSlug: org.slug, email: members.OWNER.email, password });
         await request("/auth/me", 200, loggedIn.data.token);
+        const googleLoggedIn = await request("/auth/google", 200, undefined, "POST", {
+          credential: "valid-owner-google-credential",
+        });
+        assert.equal(googleLoggedIn.data.user.id, members.OWNER.id);
+        assert.equal(googleLoggedIn.data.user.organizationId, org.id);
+        assert.equal(googleLoggedIn.data.user.role, "OWNER");
+        assert.equal(googleLoggedIn.data.organization.id, org.id);
+        await request("/auth/me", 200, googleLoggedIn.data.token);
+        await request("/auth/google", 400, undefined, "POST", {
+          credential: "valid-owner-google-credential",
+          organizationId: otherOrg.id,
+          role: "OWNER",
+        });
+        await request("/auth/google", 401, undefined, "POST", {
+          credential: "invalid-google-credential",
+        });
+        const unknownGoogle = await request("/auth/google", 403, undefined, "POST", {
+          credential: "unknown-google-credential",
+        });
+        assert.equal(unknownGoogle.code, "GOOGLE_ACCOUNT_NOT_LINKED");
         await request("/auth/login", 401, undefined, "POST", { organizationSlug: org.slug, email: members.OWNER.email, password: "wrong" });
         await request("/auth/register", 400, undefined, "POST", {});
         const registered = await request("/auth/register", 201, undefined, "POST", {
@@ -220,7 +260,10 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
             headers: { Authorization: `Bearer ${tokens[role]}` },
           });
           assert.equal(previewResponse.status, 200);
-          assert.equal(previewResponse.headers.get("content-type"), "text/plain");
+          assert.equal(
+            previewResponse.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase(),
+            "text/plain",
+          );
           assert.equal(previewResponse.headers.get("cache-control"), "private, no-store");
           assert.equal(await previewResponse.text(), "Private preview document");
           const aiResponse = await request("/ai/ask", 200, tokens[role], "POST", {
@@ -479,6 +522,8 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
       else app.locals.ragDependencies = originalRagDependencies;
       if (originalAIConversationDependencies === undefined) delete app.locals.aiConversationDependencies;
       else app.locals.aiConversationDependencies = originalAIConversationDependencies;
+      if (originalGoogleAuthDependencies === undefined) delete app.locals.googleAuthDependencies;
+      else app.locals.googleAuthDependencies = originalGoogleAuthDependencies;
       if (httpServer) await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
     }
     assert.deepEqual(await counts(), before, "all fixture writes must be rolled back");
@@ -492,6 +537,8 @@ test("Phase 0–12 API regression with rollback-only MySQL fixtures and mocked e
     else app.locals.ragDependencies = originalRagDependencies;
     if (originalAIConversationDependencies === undefined) delete app.locals.aiConversationDependencies;
     else app.locals.aiConversationDependencies = originalAIConversationDependencies;
+    if (originalGoogleAuthDependencies === undefined) delete app.locals.googleAuthDependencies;
+    else app.locals.googleAuthDependencies = originalGoogleAuthDependencies;
     await prisma.$disconnect();
   }
 });

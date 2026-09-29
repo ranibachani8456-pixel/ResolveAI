@@ -48,6 +48,10 @@ enum AIMessageRole {
   ASSISTANT
 }
 
+enum AuthProvider {
+  GOOGLE
+}
+
 model Organization {
   id              Int              @id @default(autoincrement())
   name            String           @db.VarChar(191)
@@ -75,9 +79,25 @@ model User {
   assignedTickets Ticket[]         @relation("TicketAssignee")
   messages        Message[]        @relation("UserMessages")
   aiConversations AIConversation[] @relation("AIConversationCreator")
+  authIdentities  AuthIdentity[]
 
   // This unique index also supports queries scoped by organizationId.
   @@unique([organizationId, email])
+}
+
+model AuthIdentity {
+  id              Int          @id @default(autoincrement())
+  userId          Int
+  provider        AuthProvider
+  providerSubject String       @db.VarChar(191)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // A provider account maps to exactly one ResolveAI user, and each user has
+  // at most one identity for a given provider.
+  @@unique([provider, providerSubject])
+  @@unique([userId, provider])
 }
 
 model Customer {

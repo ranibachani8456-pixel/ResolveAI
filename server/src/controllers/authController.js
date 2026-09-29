@@ -3,19 +3,26 @@ import {
   AuthServiceError,
   getCurrentUser,
   login,
+  loginWithGoogle,
   register,
 } from "../services/authService.js";
 import { JwtConfigurationError } from "../utils/jwt.js";
+import { GoogleIdentityConfigurationError } from "../services/googleIdentityService.js";
 
 function handleAuthError(error, response) {
   if (error instanceof AuthServiceError) {
     return response.status(error.statusCode).json({
       success: false,
       message: error.message,
+      ...(error.code ? { code: error.code } : {}),
     });
   }
 
-  if (error instanceof AuthConfigurationError || error instanceof JwtConfigurationError) {
+  if (
+    error instanceof AuthConfigurationError ||
+    error instanceof JwtConfigurationError ||
+    error instanceof GoogleIdentityConfigurationError
+  ) {
     console.error(`Authentication configuration error: ${error.message}`);
     return response.status(500).json({
       success: false,
@@ -51,6 +58,22 @@ export async function loginUser(request, response) {
     return response.status(200).json({
       success: true,
       message: "Login successful",
+      data: result,
+    });
+  } catch (error) {
+    return handleAuthError(error, response);
+  }
+}
+
+export async function loginGoogleUser(request, response) {
+  try {
+    const result = await loginWithGoogle(
+      request.body,
+      request.app?.locals?.googleAuthDependencies,
+    );
+    return response.status(200).json({
+      success: true,
+      message: "Google login successful",
       data: result,
     });
   } catch (error) {

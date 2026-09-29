@@ -8,6 +8,7 @@ export const env = {
   jwtSecret: process.env.JWT_SECRET,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || "1d",
   bcryptRounds: Number(process.env.BCRYPT_ROUNDS || 12),
+  googleClientId: process.env.GOOGLE_CLIENT_ID,
   awsRegion: process.env.AWS_REGION,
   awsS3Bucket: process.env.AWS_S3_BUCKET,
   awsSqsDocumentQueueUrl: process.env.AWS_SQS_DOCUMENT_QUEUE_URL,

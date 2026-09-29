@@ -52,6 +52,12 @@ export function AuthProvider({ children }) {
     return response.data;
   }, [establishSession]);
 
+  const googleLogin = useCallback(async (credential, signal) => {
+    const response = await authApi.google(credential, signal);
+    establishSession(response.data);
+    return response.data;
+  }, [establishSession]);
+
   const register = useCallback(async (details, signal) => {
     const response = await authApi.register(details, signal);
     establishSession(response.data);
@@ -80,6 +86,9 @@ export function AuthProvider({ children }) {
     return () => window.removeEventListener("resolveai:unauthorized", logout);
   }, [logout]);
 
-  const value = useMemo(() => ({ ...state, login, register, logout }), [state, login, register, logout]);
+  const value = useMemo(
+    () => ({ ...state, login, googleLogin, register, logout }),
+    [state, login, googleLogin, register, logout],
+  );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

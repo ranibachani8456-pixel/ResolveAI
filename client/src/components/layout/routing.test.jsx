@@ -9,7 +9,7 @@ function authValue(overrides = {}) {
     status: "authenticated",
     user: { id: 1, name: "Rani", role: "VIEWER", organization: { name: "Acme" } },
     organization: { id: 1, name: "Acme", slug: "acme" },
-    logout: vi.fn(), login: vi.fn(), register: vi.fn(),
+    logout: vi.fn(), login: vi.fn(), googleLogin: vi.fn(), register: vi.fn(),
     ...overrides,
   };
 }

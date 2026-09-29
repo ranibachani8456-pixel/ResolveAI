@@ -10,6 +10,8 @@ export default defineConfig({
     css: true,
   },
   server: {
+    // Preserve popup communication for browsers that are not using FedCM.
+    headers: { "Cross-Origin-Opener-Policy": "same-origin-allow-popups" },
     // The proxy lets the browser call /api without local CORS or hard-coded URLs.
     proxy: {
       "/api": "http://localhost:5001",

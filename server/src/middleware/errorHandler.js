@@ -7,9 +7,12 @@ export function errorHandler(error, _request, response, _next) {
   }
 
   console.error(error);
+  const statusCode = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500
+    ? error.status
+    : 500;
 
-  return response.status(error.status || 500).json({
+  return response.status(statusCode).json({
     success: false,
-    message: error.message || "Internal server error",
+    message: statusCode < 500 ? error.message : "Internal server error",
   });
 }
